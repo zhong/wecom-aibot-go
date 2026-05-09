@@ -159,22 +159,37 @@ type FileMessage struct {
 	File FileContent `json:"file"`
 }
 
+// TemplateCardEventData holds the nested template_card_event fields
+// that WeCom sends inside the event object for interactive card callbacks.
+//
+// When a user clicks a button on an interactive template card, the
+// aibot_event_callback event body contains:
+//
+//	{"eventtype":"template_card_event","template_card_event":{"card_type":"...","event_key":"...","task_id":"..."}}
+type TemplateCardEventData struct {
+	CardType string `json:"card_type"`
+	EventKey string `json:"event_key"`
+	TaskID   string `json:"task_id"`
+}
+
 type EventContent struct {
-	EventType string `json:"eventtype"`
-	EventKey  string `json:"event_key,omitempty"`
-	TaskID    string `json:"task_id,omitempty"`
+	EventType         string                `json:"eventtype"`
+	EventKey          string                `json:"event_key,omitempty"`
+	TaskID            string                `json:"task_id,omitempty"`
+	TemplateCardEvent TemplateCardEventData `json:"template_card_event,omitempty"`
 }
 
 type EventMessage struct {
-	ReqID      string       `json:"-"`
-	MsgID      string       `json:"msgid"`
-	CreateTime int64        `json:"create_time"`
-	AIBotID    string       `json:"aibotid"`
-	ChatID     string       `json:"chatid,omitempty"`
-	ChatType   string       `json:"chattype,omitempty"`
-	From       EventFrom    `json:"from"`
-	MsgType    string       `json:"msgtype"`
-	Event      EventContent `json:"event"`
+	ReqID       string       `json:"-"`
+	MsgID       string       `json:"msgid"`
+	CreateTime  int64        `json:"create_time"`
+	AIBotID     string       `json:"aibotid"`
+	ChatID      string       `json:"chatid,omitempty"`
+	ChatType    string       `json:"chattype,omitempty"`
+	From        EventFrom    `json:"from"`
+	MsgType     string       `json:"msgtype"`
+	Event       EventContent `json:"event"`
+	ResponseURL string       `json:"response_url,omitempty"`
 }
 
 func (m EventMessage) RequestID() string {
