@@ -1,4 +1,4 @@
-module github.com/Area1m/wecom-aibot-go
+module github.com/zhong/wecom-aibot-go
 
 go 1.22
 
