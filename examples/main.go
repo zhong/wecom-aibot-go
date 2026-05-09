@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	wecomaibot "github.com/Area1m/wecom-aibot-go"
+	wecomaibot "github.com/zhong/wecom-aibot-go"
 )
 
 func main() {
