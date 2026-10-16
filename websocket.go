@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,10 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// defaultWriteTimeout 是发送 WebSocket 帧的写超时兜底：正常帧毫秒级写完，10s 仅用于
+// 防止对端停止读数据时 WriteMessage 永久阻塞（见 sendRawFrame）。
+const defaultWriteTimeout = 10 * time.Second
 
 type wsConnection struct {
 	cfg    Config
@@ -25,20 +30,24 @@ type wsConnection struct {
 	started     atomic.Bool
 	manualClose atomic.Bool
 
-	reconnectAttempts int
-	reconnectMu       sync.Mutex
+	reconnectAttempts   int // 连接断开（非认证失败）的重连计数，由 reconnectMu 保护
+	authFailureAttempts int // 认证失败的重连计数，由 reconnectMu 保护；与重连预算独立（对齐官方 Node SDK）
+	reconnectMu         sync.Mutex
 
 	heartbeatCancelMu sync.Mutex
 	heartbeatCancel   context.CancelFunc
-	missedPongCount   int32
-	maxMissedPong     int32
+
+	missedPongCount atomic.Int32 // 连续未收到心跳 ACK 的次数（对齐官方 Node SDK 的死连接判据）
+	lastReceivedAt  atomic.Int64 // 最近一次收到服务端数据的时刻（UnixNano，含心跳 ACK），用于观测半开连接僵尸窗口
+
+	lastCloseWasAuthFailure atomic.Bool // 最近一次连接关闭是否因认证失败，用于选择独立计数器
 
 	replyQueueMu sync.Mutex
 	replyQueues  map[string]*replyQueue
 	pendingAcks  map[string]chan ackResult
 
-	replyAckTimeout  time.Duration
-	maxReplyQueueLen int
+	replyAckTimeout time.Duration
+	authTimeout     time.Duration
 
 	onConnected     func()
 	onAuthenticated func()
@@ -46,21 +55,16 @@ type wsConnection struct {
 	onReconnecting  func(attempt int)
 	onError         func(err error)
 	onMessage       func(frame WsFrameRaw)
+	onStopped       func() // 重连耗尽彻底停止时回调，供 Client 复位 started 状态
 }
 
+// replyQueue 串行化同一 req_id 的回复：mu 保证前一条回复（含 ACK 等待）完成后
+// 才发下一条；refs 是引用计数，由 replyQueueMu 保护，归零时从 map 删除，避免
+// 为每个消息 ID 永久保留条目。
 type replyQueue struct {
 	reqID string
-	ch    chan replyTask
-}
-
-type replyTask struct {
-	frame  WsFrame
-	result chan replyResult
-}
-
-type replyResult struct {
-	frame WsFrameRaw
-	err   error
+	mu    sync.Mutex
+	refs  int
 }
 
 type ackResult struct {
@@ -69,14 +73,18 @@ type ackResult struct {
 }
 
 func newWSConnection(cfg Config, logger Logger) *wsConnection {
+	authTimeout := time.Duration(cfg.AuthTimeoutMS) * time.Millisecond
+	if authTimeout <= 0 {
+		// 直接 newWSConnection 的测试路径可能未走 fillDefaultConfig，兜底到默认值。
+		authTimeout = time.Duration(DefaultAuthTimeout) * time.Millisecond
+	}
 	return &wsConnection{
-		cfg:              cfg,
-		logger:           logger,
-		maxMissedPong:    2,
-		replyQueues:      make(map[string]*replyQueue),
-		pendingAcks:      make(map[string]chan ackResult),
-		replyAckTimeout:  5 * time.Second,
-		maxReplyQueueLen: 100,
+		cfg:             cfg,
+		logger:          logger,
+		replyQueues:     make(map[string]*replyQueue),
+		pendingAcks:     make(map[string]chan ackResult),
+		replyAckTimeout: 5 * time.Second,
+		authTimeout:     authTimeout,
 	}
 }
 
@@ -85,6 +93,9 @@ func (w *wsConnection) start(ctx context.Context) {
 		return
 	}
 	w.manualClose.Store(false)
+	// 每次重新启动都清零重连/认证失败计数：否则上一轮耗尽后 Disconnect + Connect
+	// 重启时计数器仍停在 max，拨号失败一次就立刻再次放弃。
+	w.resetReconnectAttempts()
 	go w.run(ctx)
 }
 
@@ -96,9 +107,15 @@ func (w *wsConnection) run(ctx context.Context) {
 		}
 
 		if !first {
-			attempt, ok := w.registerReconnectAttempt()
-			if !ok {
-				w.emitError(errors.New("超过最大重连次数"))
+			attempt, err := w.registerReconnectAttempt()
+			if err != nil {
+				// 复位启动状态：否则 give-up 后 started 仍为 true，Connect() 会静默空操作，
+				// 客户端永久假死，只能靠 Disconnect()+Connect() 手动复活。
+				w.started.Store(false)
+				if w.onStopped != nil {
+					w.onStopped()
+				}
+				w.emitError(err)
 				return
 			}
 			delay := w.nextReconnectDelay(attempt)
@@ -115,7 +132,7 @@ func (w *wsConnection) run(ctx context.Context) {
 		}
 		first = false
 
-		reason, err := w.runSession(ctx)
+		reason, err := w.runSessionSafely(ctx)
 		if reason != "" {
 			w.emitDisconnected(reason)
 		}
@@ -125,16 +142,41 @@ func (w *wsConnection) run(ctx context.Context) {
 	}
 }
 
+// runSessionSafely 给会话 goroutine 兜 panic：SDK 自己的 goroutine 里一旦 panic
+// 会把整个客户端打死（run 退出但 started 仍为 true，用户连 Connect 都救不回来，
+// 表现为永久假死、不报错、不重连）。这里把 panic 转成错误，交给外层按普通断线走重连。
+func (w *wsConnection) runSessionSafely(ctx context.Context) (reason string, err error) {
+	defer func() {
+		rec := recover()
+		if rec == nil {
+			return
+		}
+		err = fmt.Errorf("会话处理 panic: %v", rec)
+		reason = err.Error()
+		w.logger.Error("%v\n%s", err, debug.Stack())
+		w.stopHeartbeat()
+		w.notifyPendingAckError(err)
+		if conn := w.getConn(); conn != nil {
+			_ = conn.Close()
+			w.setConn(nil)
+		}
+	}()
+	return w.runSession(ctx)
+}
+
 func (w *wsConnection) runSession(ctx context.Context) (string, error) {
-	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+		NetDialContext:   w.dial,
+	}
 	conn, _, err := dialer.DialContext(ctx, w.cfg.WSURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("建立 WebSocket 连接失败: %w", err)
 	}
 
+	// 新连接建立即清除「认证失败」标记：只有本会话内认证被拒（errcode!=0）才会再置位。
+	w.lastCloseWasAuthFailure.Store(false)
 	w.setConn(conn)
-	w.resetReconnectAttempts()
-	atomic.StoreInt32(&w.missedPongCount, 0)
 	w.emitConnected()
 
 	if err := w.sendAuth(); err != nil {
@@ -142,6 +184,11 @@ func (w *wsConnection) runSession(ctx context.Context) (string, error) {
 		w.setConn(nil)
 		return "发送认证帧失败", err
 	}
+
+	// 认证帧已发出，进入等待订阅 ACK 的窗口：此窗口内心跳尚未启动，且认证帧被 TCP ACK 后
+	// 也没有未 ACK 数据可让 TCP_USER_TIMEOUT 触发，必须靠读超时兜底，否则企微静默掐线会
+	// 导致永久卡 connecting（前端「一直转圈」）。
+	_ = conn.SetReadDeadline(time.Now().Add(w.authTimeout))
 
 	for {
 		_, data, err := conn.ReadMessage()
@@ -156,6 +203,10 @@ func (w *wsConnection) runSession(ctx context.Context) (string, error) {
 			return fmt.Sprintf("连接断开: %v", err), nil
 		}
 
+		// 每成功读到一帧（含心跳 ACK）就刷新 liveness 时间戳，供 LastReceivedAt 观测
+		// 半开连接：从真死到心跳判死之间这里会停止更新，从而暴露僵尸窗口。
+		w.lastReceivedAt.Store(time.Now().UnixNano())
+
 		var frame WsFrameRaw
 		if err := json.Unmarshal(data, &frame); err != nil {
 			w.emitError(fmt.Errorf("解析消息失败: %w", err))
@@ -167,46 +218,93 @@ func (w *wsConnection) runSession(ctx context.Context) (string, error) {
 
 func (w *wsConnection) handleFrame(ctx context.Context, frame WsFrameRaw) {
 	if frame.Cmd == WsCmdCallback || frame.Cmd == WsCmdEventCallback {
+		// disconnected_event：同一 BotID 被新连接顶掉，服务端即将断开本连接。此时不能再自动
+		// 重连（否则会反过来顶掉新连接，形成互踢死循环），故标记手动关闭并复位启动状态，
+		// 让 Connect() 能干净重启。事件仍透传，用户可经 OnDisconnectedEvent 感知「被踢」。
+		if frame.Cmd == WsCmdEventCallback && isDisconnectedEvent(frame.Body) {
+			w.logger.Warn("收到 disconnected_event：连接被同 BotID 的新连接顶掉，停止自动重连")
+			w.manualClose.Store(true)
+			w.started.Store(false)
+			if w.onStopped != nil {
+				w.onStopped()
+			}
+			if conn := w.getConn(); conn != nil {
+				_ = conn.Close()
+				w.setConn(nil)
+			}
+		}
 		w.emitMessage(frame)
 		return
 	}
 
 	reqID := frame.Headers.ReqID
-	if reqID == "" {
-		return
-	}
-
-	if w.resolveAck(reqID, frame) {
-		return
-	}
-
-	if strings.HasPrefix(reqID, WsCmdSubscribe+"_") {
-		if frame.ErrCode != 0 {
-			w.emitError(fmt.Errorf("认证失败: errcode=%d errmsg=%s", frame.ErrCode, frame.ErrMsg))
+	if reqID != "" {
+		if w.resolveAck(reqID, frame) {
 			return
 		}
-		w.startHeartbeat(ctx)
-		w.emitAuthenticated()
-		return
-	}
 
-	if strings.HasPrefix(reqID, WsCmdHeartbeat+"_") {
-		if frame.ErrCode == 0 {
-			atomic.StoreInt32(&w.missedPongCount, 0)
+		if strings.HasPrefix(reqID, WsCmdSubscribe+"_") {
+			if frame.ErrCode != 0 {
+				w.emitError(fmt.Errorf("认证失败: errcode=%d errmsg=%s", frame.ErrCode, frame.ErrMsg))
+				// 标记本次关闭为「认证失败」，让重连走独立的 authFailureAttempts 预算（对齐官方
+				// Node SDK），避免认证抖动吞掉正常断线重连预算。
+				w.lastCloseWasAuthFailure.Store(true)
+				// 认证被拒绝时主动关闭连接，让读循环返回并走正常重连；否则会停在
+				// 「已连接但未认证」的假死态——无心跳、无消息，IsConnected 仍为 true。
+				if conn := w.getConn(); conn != nil {
+					_ = conn.Close()
+					w.setConn(nil)
+				}
+				return
+			}
+			// 认证成功才算一次稳定连接，此时才清零重连/认证失败计数。不能放在拨号成功处：
+			// 那样「拨号成功但认证失败」每次都会清零，绕过 MaxAuthFailureAttempts 无限重试。
+			w.resetReconnectAttempts()
+			// 认证成功：清除「等待订阅 ACK」的读超时，恢复「无读超时 + 心跳保活」的常态。
+			if c := w.getConn(); c != nil {
+				_ = c.SetReadDeadline(time.Time{})
+			}
+			w.startHeartbeat(ctx)
+			w.emitAuthenticated()
 			return
 		}
-		w.logger.Warn("心跳 ACK 异常: errcode=%d errmsg=%s", frame.ErrCode, frame.ErrMsg)
-		return
+
+		// 心跳 ACK：服务端会回 errcode=0 的 ACK（req_id 透传 ping_ 前缀，无 cmd 字段）。
+		// 收到即清零连续未 ACK 计数；静默处理、不透传给消息处理器，避免把 ACK 当成消息。
+		if strings.HasPrefix(reqID, WsCmdHeartbeat+"_") {
+			if frame.ErrCode != 0 {
+				w.logger.Warn("心跳 ACK 异常: reqid=%s errcode=%d errmsg=%s", reqID, frame.ErrCode, frame.ErrMsg)
+				return
+			}
+			w.missedPongCount.Store(0)
+			return
+		}
 	}
 
+	// 与官方一致：无法归类的帧记录 warn 并透传给消息处理器，而非静默丢弃，
+	// 便于未来服务端新增帧类型时能及时暴露。
+	w.logger.Warn("收到未知帧: reqid=%s cmd=%s errcode=%d", reqID, frame.Cmd, frame.ErrCode)
 	w.emitMessage(frame)
+}
+
+// isDisconnectedEvent 判断事件回调是否为 disconnected_event（被同 BotID 的新连接顶掉）。
+func isDisconnectedEvent(body json.RawMessage) bool {
+	var parsed struct {
+		Event struct {
+			EventType string `json:"eventtype"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return false
+	}
+	return parsed.Event.EventType == EventTypeDisconnectedEvent
 }
 
 func (w *wsConnection) disconnect() {
 	w.manualClose.Store(true)
 	w.started.Store(false)
 	w.stopHeartbeat()
-	w.notifyPendingAckError(errors.New("连接已手动关闭"))
+	w.notifyPendingAckError(fmt.Errorf("连接已手动关闭: %w", ErrNotConnected))
 	conn := w.getConn()
 	if conn != nil {
 		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "manual disconnect"), time.Now().Add(time.Second))
@@ -220,6 +318,15 @@ func (w *wsConnection) isConnected() bool {
 	return conn != nil
 }
 
+// lastReceivedAtTime 返回最近一次收到服务端数据的时刻；从未收到返回零值。
+func (w *wsConnection) lastReceivedAtTime() time.Time {
+	ns := w.lastReceivedAt.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
 func (w *wsConnection) sendReply(reqID string, body any, cmd string) (WsFrameRaw, error) {
 	if reqID == "" {
 		return WsFrameRaw{}, errors.New("reqID 不能为空")
@@ -228,66 +335,53 @@ func (w *wsConnection) sendReply(reqID string, body any, cmd string) (WsFrameRaw
 		cmd = WsCmdResponse
 	}
 
-	queue := w.getOrCreateReplyQueue(reqID)
-	task := replyTask{
-		frame: WsFrame{
-			Cmd: cmd,
-			Headers: WsHeaders{
-				ReqID: reqID,
-			},
-			Body: body,
+	// 同一 req_id 的回复串行执行：acquire 加引用计数（保证清理安全），mu 保证
+	// 前一条回复的 ACK 等待完成前不发送下一条。发送+等待 ACK 在调用方 goroutine
+	// 内完成（reply 类 API 只从用户 handler 调用，不会阻塞读循环）。
+	q := w.acquireReplyQueue(reqID)
+	defer w.releaseReplyQueue(q)
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	return w.sendAndWaitAck(reqID, WsFrame{
+		Cmd: cmd,
+		Headers: WsHeaders{
+			ReqID: reqID,
 		},
-		result: make(chan replyResult, 1),
-	}
-
-	select {
-	case queue.ch <- task:
-	default:
-		return WsFrameRaw{}, fmt.Errorf("reqID=%s 的回复队列已满", reqID)
-	}
-
-	res := <-task.result
-	return res.frame, res.err
+		Body: body,
+	})
 }
 
-func (w *wsConnection) getOrCreateReplyQueue(reqID string) *replyQueue {
+// hasPendingAck 返回指定 req_id 是否还有正在等待回执的回复（供流式场景避免积压，对齐官方 Node SDK）。
+func (w *wsConnection) hasPendingAck(reqID string) bool {
+	w.replyQueueMu.Lock()
+	defer w.replyQueueMu.Unlock()
+	_, ok := w.pendingAcks[reqID]
+	return ok
+}
+
+func (w *wsConnection) acquireReplyQueue(reqID string) *replyQueue {
 	w.replyQueueMu.Lock()
 	defer w.replyQueueMu.Unlock()
 
-	if q, ok := w.replyQueues[reqID]; ok {
-		return q
+	q, ok := w.replyQueues[reqID]
+	if !ok {
+		q = &replyQueue{reqID: reqID}
+		w.replyQueues[reqID] = q
 	}
-	q := &replyQueue{
-		reqID: reqID,
-		ch:    make(chan replyTask, w.maxReplyQueueLen),
-	}
-	w.replyQueues[reqID] = q
-	go w.processReplyQueue(q)
+	q.refs++
 	return q
 }
 
-func (w *wsConnection) processReplyQueue(queue *replyQueue) {
-	idleTimer := time.NewTimer(2 * time.Minute)
-	defer idleTimer.Stop()
+func (w *wsConnection) releaseReplyQueue(q *replyQueue) {
+	w.replyQueueMu.Lock()
+	defer w.replyQueueMu.Unlock()
 
-	for {
-		select {
-		case task := <-queue.ch:
-			if !idleTimer.Stop() {
-				select {
-				case <-idleTimer.C:
-				default:
-				}
-			}
-			idleTimer.Reset(2 * time.Minute)
-			frame, err := w.sendAndWaitAck(queue.reqID, task.frame)
-			task.result <- replyResult{frame: frame, err: err}
-		case <-idleTimer.C:
-			w.replyQueueMu.Lock()
-			delete(w.replyQueues, queue.reqID)
-			w.replyQueueMu.Unlock()
-			return
-		}
+	// refs 归零说明没有调用方再持有该队列，可安全删除。acquire/release 都持
+	// replyQueueMu，refs>0 期间队列必在 map 中，因此这里 delete 不会误删别的条目。
+	if q.refs--; q.refs == 0 {
+		delete(w.replyQueues, q.reqID)
 	}
 }
 
@@ -357,7 +451,7 @@ func (w *wsConnection) notifyPendingAckError(err error) {
 func (w *wsConnection) sendRawFrame(frame WsFrame) error {
 	conn := w.getConn()
 	if conn == nil {
-		return errors.New("WebSocket 未连接")
+		return ErrNotConnected
 	}
 
 	payload, err := json.Marshal(frame)
@@ -367,6 +461,10 @@ func (w *wsConnection) sendRawFrame(frame WsFrame) error {
 
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
+	// 写超时兜底：对端「活着但停止读、TCP 接收窗口打满」时 WriteMessage 会永久阻塞，
+	// 进而占住 writeMu 卡死后续心跳与回复。设一个宽裕的写期限，超时即按写失败走重连。
+	_ = conn.SetWriteDeadline(time.Now().Add(defaultWriteTimeout))
+	defer conn.SetWriteDeadline(time.Time{})
 	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
 		return fmt.Errorf("发送 WebSocket 帧失败: %w", err)
 	}
@@ -385,22 +483,35 @@ func (w *wsConnection) getConn() *websocket.Conn {
 	return w.conn
 }
 
-func (w *wsConnection) registerReconnectAttempt() (int, bool) {
+// registerReconnectAttempt 根据上次断开类型选择独立的计数器与上限（对齐官方 Node SDK）：
+// 认证失败走 authFailureAttempts / MaxAuthFailureAttempts，连接断开走 reconnectAttempts /
+// MaxReconnectAttempts，二者互不占用。返回本次尝试序号；计数耗尽时返回对应错误。
+func (w *wsConnection) registerReconnectAttempt() (int, error) {
 	w.reconnectMu.Lock()
 	defer w.reconnectMu.Unlock()
 
+	if w.lastCloseWasAuthFailure.Load() {
+		max := w.cfg.MaxAuthFailureAttempts
+		if max != -1 && w.authFailureAttempts >= max {
+			return 0, ErrAuthFailureExhausted
+		}
+		w.authFailureAttempts++
+		return w.authFailureAttempts, nil
+	}
+
 	max := w.cfg.MaxReconnectAttempts
 	if max != -1 && w.reconnectAttempts >= max {
-		return 0, false
+		return 0, ErrReconnectExhausted
 	}
 	w.reconnectAttempts++
-	return w.reconnectAttempts, true
+	return w.reconnectAttempts, nil
 }
 
 func (w *wsConnection) resetReconnectAttempts() {
 	w.reconnectMu.Lock()
 	defer w.reconnectMu.Unlock()
 	w.reconnectAttempts = 0
+	w.authFailureAttempts = 0
 }
 
 func (w *wsConnection) emitConnected() {
