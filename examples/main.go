@@ -18,10 +18,13 @@ func main() {
 		log.Fatal("请先设置环境变量 WECOM_BOT_ID 和 WECOM_BOT_SECRET")
 	}
 
-	bot := wecomaibot.NewClient(wecomaibot.Config{
+	bot, err := wecomaibot.NewClient(wecomaibot.Config{
 		BotID:  botID,
 		Secret: secret,
 	})
+	if err != nil {
+		log.Fatalf("创建客户端失败: %v", err)
+	}
 
 	bot.OnAuthenticated(func(ctx context.Context) {
 		log.Println("认证成功")
@@ -43,7 +46,10 @@ func main() {
 	})
 
 	bot.OnEnterChat(func(ctx context.Context, msg wecomaibot.EventMessage) {
-		_, err := bot.ReplyWelcomeText(msg, "您好！我是企业微信智能助手（Go SDK）。")
+		_, err := bot.ReplyWelcome(msg, map[string]any{
+			"msgtype": "text",
+			"text":    map[string]any{"content": "您好！我是企业微信智能助手（Go SDK）。"},
+		})
 		if err != nil {
 			log.Printf("发送欢迎语失败: %v", err)
 		}

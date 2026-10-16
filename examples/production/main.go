@@ -19,13 +19,17 @@ func main() {
 		log.Fatal("请先设置环境变量 WECOM_BOT_ID 和 WECOM_BOT_SECRET")
 	}
 
-	bot := wecomaibot.NewClient(wecomaibot.Config{
-		BotID:                botID,
-		Secret:               secret,
-		MaxReconnectAttempts: -1,
-		ReconnectIntervalMS:  1000,
-		HeartbeatIntervalMS:  30000,
+	bot, err := wecomaibot.NewClient(wecomaibot.Config{
+		BotID:                  botID,
+		Secret:                 secret,
+		MaxReconnectAttempts:   -1,
+		MaxAuthFailureAttempts: -1, // 认证失败也无限重试（与重连预算独立）
+		ReconnectIntervalMS:    1000,
+		HeartbeatIntervalMS:    30000,
 	})
+	if err != nil {
+		log.Fatalf("创建客户端失败: %v", err)
+	}
 
 	registerLifecycleLogs(bot)
 	registerBusinessHandlers(bot)
@@ -87,7 +91,10 @@ func registerBusinessHandlers(bot *wecomaibot.Client) {
 
 	bot.OnEnterChat(func(ctx context.Context, msg wecomaibot.EventMessage) {
 		safeGo("欢迎语处理", func() {
-			_, err := bot.ReplyWelcomeText(msg, "您好，我是企业微信智能机器人。")
+			_, err := bot.ReplyWelcome(msg, map[string]any{
+				"msgtype": "text",
+				"text":    map[string]any{"content": "您好，我是企业微信智能机器人。"},
+			})
 			if err != nil {
 				log.Printf("发送欢迎语失败: %v", err)
 			}
@@ -112,7 +119,10 @@ func replyWithRetry(bot *wecomaibot.Client, msg wecomaibot.TextMessage, streamID
 	}
 
 	if msg.ChatID != "" {
-		_, fallbackErr := bot.SendMarkdown(msg.ChatID, "系统繁忙，请稍后重试")
+		_, fallbackErr := bot.SendMessage(msg.ChatID, map[string]any{
+			"msgtype":  "markdown",
+			"markdown": map[string]any{"content": "系统繁忙，请稍后重试"},
+		})
 		if fallbackErr != nil {
 			log.Printf("降级发送失败: %v", fallbackErr)
 		}
@@ -122,9 +132,17 @@ func replyWithRetry(bot *wecomaibot.Client, msg wecomaibot.TextMessage, streamID
 }
 
 func startHealthServer(bot *wecomaibot.Client) {
+	// 半开连接从「真死」到「心跳判死」约有 2×心跳间隔（这里心跳 30s，约 60s）的僵尸窗口，
+	// 期间 IsConnected 仍为 true 但收不到任何消息。healthz 额外用「最近收到数据时间」兜底：
+	// 超过 2×心跳间隔 + 余量仍未收到任何数据（含心跳 ACK）即判不健康。
+	const livenessWindow = 2*30*time.Second + 10*time.Second
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if bot.IsConnected() {
+		last := bot.LastReceivedAt()
+		// last 为零值表示刚连接、还没收到第一帧（认证 ACK 未回），视为启动期正常。
+		alive := bot.IsConnected() && (last.IsZero() || time.Since(last) < livenessWindow)
+		if alive {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok"))
 			return
