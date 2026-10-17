@@ -36,4 +36,7 @@
 //
 // 重连预算分两本账（对齐官方 Node SDK）：认证失败走 MaxAuthFailureAttempts（默认 5），连接断开走
 // MaxReconnectAttempts（默认 10），互不占用——认证抖动不会吞掉断线重连预算。
+//
+// 对接大模型（OpenAI 兼容端点 / Anthropic Claude）与企微流式回复的桥接见子包
+// github.com/zhong/wecom-aibot-go/llm，完整机器人示例见 examples/llm-bot。
 package wecomaibot

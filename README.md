@@ -80,6 +80,7 @@ func main() {
 
 - 基础示例：`go run ./examples`
 - 生产模板：`go run ./examples/production`
+- LLM 机器人：`go run ./examples/llm-bot`
 
 ## 配置项
 
@@ -181,6 +182,46 @@ bot.OnTemplateCardEvent(func(ctx context.Context, msg wecomaibot.EventMessage) {
 
 > **提示**：模板卡片必须包含 `callback_id` 字段，交互回调才会携带 `event_key` / `task_id`。
 
+## 对接大模型（LLM）
+
+`llm` 子包提供与厂商无关的流式对话抽象，把大模型的增量输出桥接成企微流式回复（打字机效果）：
+
+- `llm.Client` 接口：`StreamChat(ctx, req, onDelta)`，每个内容增量回调一次
+- 两种内置实现（仅依赖标准库 `net/http`，无第三方 SDK）：
+  - `llm.NewOpenAIClient(OpenAIOptions{...})` — OpenAI 兼容 chat-completions 端点，
+    覆盖 OpenAI / DeepSeek / GLM / Qwen / vLLM / one-api 等网关（`BaseURL` 覆盖端点，
+    兼容 DeepSeek-R1 / GLM 的 `reasoning_content` 思维链增量）
+  - `llm.NewAnthropicClient(AnthropicOptions{...})` — Anthropic Claude Messages API
+- `llm.StreamReply(...)` — 流式桥：占位帧 → 累积帧（`ReplyStreamNonBlocking` 自限速）→
+  终帧；LLM 出错带半截内容或兜底文案闭环，终帧失败降级 `SendMessage`
+
+```go
+client, _ := llm.NewOpenAIClient(llm.OpenAIOptions{
+    APIKey: "sk-...", BaseURL: "https://api.deepseek.com/v1", Model: "deepseek-chat",
+})
+bot.OnText(func(ctx context.Context, msg wecomaibot.TextMessage) {
+    final, err := llm.StreamReply(ctx, bot, msg, wecomaibot.GenerateReqID("stream"), client,
+        llm.ChatRequest{
+            Messages:     []llm.ChatMessage{{Role: "user", Content: msg.Text.Content}},
+            SystemPrompt: "你是一个乐于助人的企业微信智能助手",
+        }, "正在思考...")
+    _ = final // 多轮对话场景用 final 补记 assistant 历史
+})
+```
+
+完整的多轮对话机器人示例（含每会话有界历史、语音转文本接入、健康检查、优雅停机）见
+`examples/llm-bot`：
+
+```bash
+export WECOM_BOT_ID=xxx WECOM_BOT_SECRET=xxx
+export LLM_PROVIDER=openai        # openai | anthropic
+export LLM_API_KEY=sk-... LLM_MODEL=gpt-4o
+go run ./examples/llm-bot
+```
+
+> 设计说明：库保持无状态——多轮对话历史由示例层维护（per-chat 有界 slice），
+> 这样接入方可以自由替换为 Redis / 数据库等持久化实现。
+
 ## 文件下载与解密
 
 ```go
@@ -228,8 +269,10 @@ wecom-aibot-go/
   logger.go         日志接口与默认实现
   types.go          协议类型、常量与配置
   utils.go          req_id 生成
+  llm/              大模型对接子包（OpenAI 兼容 + Anthropic + 流式桥）
   examples/main.go
   examples/production/main.go
+  examples/llm-bot/main.go
   .github/workflows/ci.yml
   LICENSE
 ```
