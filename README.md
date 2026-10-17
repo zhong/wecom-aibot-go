@@ -385,6 +385,7 @@ wecom-aibot-go/
   doc.go            包文档与用法示例
   client.go         客户端：连接、连接生命周期回调注册
   websocket.go      WebSocket 会话、帧收发与 ACK 关联
+  dial.go           WebSocket 拨号（TCP 选项、代理与超时）
   auth.go           认证
   heartbeat.go      心跳保活
   reconnect.go      指数退避重连
