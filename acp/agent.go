@@ -3,11 +3,13 @@
 //
 // 定位：本仓库只做 agent 与企业微信之间的连接层。会话面走 ACP——
 // 企微每条推送消息成为一次发往持久 agent 会话的 session/prompt，
-// agent 的 agent_message_chunk 流映射为企微流式回复帧（打字机）；
-// 工具面仍由 agent 侧自行接入（如 MCP），不经本包转发。
+// agent 的 agent_message_chunk 流映射为企微流式回复帧（打字机）。
+// 工具面默认由 agent 侧自行接入；也可用 EnableTools（见 tools.go）启用
+// 仓库 mcp 包提供的进程内工具面（模板卡片 / markdown / 读附件），
+// agent（pi）经其项目配置自动以 MCP 客户端身份接入。
 //
 // 本包只依赖 Go 标准库与既有 gorilla/websocket（经根包），不引入
-// ACP SDK；单向依赖根包（wecomaibot），根包不感知本包。
+// ACP SDK；单向依赖根包（wecomaibot）与 mcp 包，根包不感知本包。
 package acp
 
 import (
@@ -283,9 +285,11 @@ func (p *agentProc) initialize(ctx context.Context) error {
 	return nil
 }
 
-// newSessionOnly 创建一个会话（握手已完成），返回 sessionId。
-func (p *agentProc) newSessionOnly(ctx context.Context) (string, error) {
-	r, err := p.call(ctx, "session/new", map[string]any{"cwd": "/tmp", "mcpServers": []any{}}, 60000)
+// newSessionOnly 创建一个会话（握手已完成）。cwd 是 agent 会话的工作目录
+// ——启用工具面时为该企微会话的专属目录（其 .pi/mcp.json 指向会话专属
+// MCP 端点），返回 sessionId。
+func (p *agentProc) newSessionOnly(ctx context.Context, cwd string) (string, error) {
+	r, err := p.call(ctx, "session/new", map[string]any{"cwd": cwd, "mcpServers": []any{}}, 60000)
 	if err != nil {
 		return "", fmt.Errorf("ACP session/new: %w", err)
 	}

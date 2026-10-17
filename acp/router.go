@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	wecomaibot "github.com/zhong/wecom-aibot-go"
+	"github.com/zhong/wecom-aibot-go/mcp"
 )
 
 // Router 把企微会话（chatid 或单聊 userid）路由到各自的 ACP agent
@@ -17,6 +18,10 @@ type Router struct {
 
 	mu       sync.Mutex
 	sessions map[string]*sessionEntry
+
+	// 工具面（可选，EnableTools 启用）：工具执行端点 + 每会话 cwd 基目录。
+	surface     mcp.ToolSurface // 由 toolsStateMu 保护
+	toolWorkDir string
 }
 
 // sessionEntry 是一个企微会话的路由条目：session 桥接器 + 消息串行锁。
@@ -38,15 +43,41 @@ func NewRouter(ctx context.Context, bot *wecomaibot.Client, cfg AgentConfig) (*R
 	return &Router{proc: proc, bot: bot, sessions: map[string]*sessionEntry{}}, nil
 }
 
-// entry 取（或惰性创建）一个企微会话的路由条目。
+// entry 取（或惰性创建）一个企微会话的路由条目。启用工具面时，每个新
+// 会话各建一个专属 cwd 目录（其 .pi/mcp.json 指向会话专属 MCP 端点，
+// 由 enableSessionTools 完成）。返回的条目携带该会话的 agent cwd
+// （工具面附件落盘目录；未启用时为空）。
+
+// sessionCwd 返回该会话 agent 的 cwd：启用工具面时是 workDir 下的专属
+// 目录（附件落盘/项目配置都在这里），否则空。
+func (r *Router) sessionCwd(chatKey string) string {
+	surface, workDir := r.toolSurface()
+	if surface == nil {
+		return ""
+	}
+	return sessionWorkDir(workDir, chatKey)
+}
+
 func (r *Router) entry(chatKey string) (*sessionEntry, error) {
+	// 工具面状态惰性快照：entry 持 Router.mu 串行读，Handle 不会与
+	// EnableTools 并发（EnableTools 须在首条消息前调用，文档已注明）。
+	surface, workDir := r.toolSurface()
+	if surface != nil {
+		if err := r.enableSessionTools(chatKey, surface, workDir); err != nil {
+			return nil, err
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if e, ok := r.sessions[chatKey]; ok {
 		return e, nil
 	}
 	// session/new 期间持锁：并发首消息只建一个条目
-	acpID, err := r.proc.initializeSession(context.Background())
+	cwd := "/tmp"
+	if surface != nil {
+		cwd = sessionWorkDir(workDir, chatKey)
+	}
+	acpID, err := r.proc.initializeSession(context.Background(), cwd)
 	if err != nil {
 		return nil, err
 	}
@@ -68,6 +99,14 @@ func (r *Router) Handle(ctx context.Context, chatKey string, req wecomaibot.Requ
 	// 串行：进行中的 ask 未收尾时，本条消息排队（不丢弃、不并行交叠）
 	e.mu <- struct{}{}
 	defer func() { <-e.mu }()
+
+	// 工具面：prompt 在途期间把消息载体快照登进 MCP 端点（agent 由此连到
+	// 本会话的执行上下文；saveDir 传会话 cwd，附件落盘写到 agent 能读的地方）。
+	// defer 在释放串行锁前清除（LIFO），同会话的下一条消息不可能读到别的快照。
+	if surface, _ := r.toolSurface(); surface != nil {
+		surface.SetChat(chatKey, req, r.sessionCwd(chatKey))
+		defer surface.ClearChat(chatKey)
+	}
 
 	e.s.begin(req, streamID)
 	return e.s.ask(ctx, userText), nil
@@ -92,7 +131,7 @@ func RouterBind(bot *wecomaibot.Client, r *Router) {
 		}
 	}
 	bot.OnText(func(ctx context.Context, m wecomaibot.TextMessage) {
-		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, m.Text.Content)
+		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, textWithQuoteHint(m.Text.Content, m.Quote))
 	})
 	bot.OnVoice(func(ctx context.Context, m wecomaibot.VoiceMessage) {
 		// 语音已被企微转写（VoiceContent 无下载 URL，只有转写文本）
@@ -119,6 +158,19 @@ func RouterBind(bot *wecomaibot.Client, r *Router) {
 	})
 }
 
+// textWithQuoteHint 组装文本消息的 prompt：群聊里独立图片/文件不产生
+// 回调，用户会以「引用附件 @机器人」的方式送达附件——给 agent 一句提示，
+// 附件本体由 read_attachment 工具读取；引用纯文本/无引用不加提示。
+func textWithQuoteHint(content string, quote *wecomaibot.QuoteContent) string {
+	if quote == nil {
+		return content
+	}
+	if quote.Image != nil || quote.File != nil || quote.Mixed != nil {
+		return content + "\n[用户引用了一个附件，可用 read_attachment 读取]"
+	}
+	return content
+}
+
 // chatKeyOf 生成路由键：群聊用 ChatID；单聊没有 ChatID 时用 userid。
 func chatKeyOf(base wecomaibot.BaseMessage, userID string) string {
 	if base.ChatID != "" {
@@ -127,7 +179,8 @@ func chatKeyOf(base wecomaibot.BaseMessage, userID string) string {
 	return "dm:" + userID
 }
 
-// initializeSession 在已有 initialize 握手之后新建一个 agent 会话。
-func (p *agentProc) initializeSession(ctx context.Context) (string, error) {
-	return p.newSessionOnly(ctx)
+// initializeSession 在已有 initialize 握手之后新建一个 agent 会话，
+// cwd 作为 agent 会话的工作目录。
+func (p *agentProc) initializeSession(ctx context.Context, cwd string) (string, error) {
+	return p.newSessionOnly(ctx, cwd)
 }

@@ -240,7 +240,11 @@ markdown 补充消息、何时直接文本回复、何时先读用户附件再�
   - `send_template_card` — 发模板卡片（通知/数据展示/用户交互类内容）
   - `send_markdown` — 补充发送格式化长文本（表格、多层列表等）
   - `read_attachment` — 读取用户消息携带的附件（自动下载并 AES 解密，
-    文本类附件回喂内容预览，图片/音视频回喂元信息）
+    文本类附件回喂内容预览，图片/音视频回喂元信息；用户「引用附件
+    @机器人」送达的图片/文件/图文混排同样当作本条消息的附件可读——
+    群聊里独立附件不产生回调，引用是官方可达路径）。外部 agent 模式下
+    参数 `save: true` 可把二进制附件落盘到 agent 会话目录并返回
+    `saved` 本地路径，pi 等带视觉能力的 agent 可直接读图片
 
 ```go
 chatReq := llm.ChatRequest{
@@ -276,12 +280,13 @@ acp.RouterBind(bot, router) // 绑定后文本/语音/图片/文件/视频/图�
 bot.Connect()
 ```
 
-架构分工（连接层只管会话面，工具面归 agent）：
+架构分工（连接层只管会话面）：
 
 ```
 企微 ⇄ 本SDK（acp.Router = ACP client + 会话路由 + 打字机桥）
          ├─ 会话面: ACP session/prompt ⇄ 外部 agent 子进程
-         └─ 工具面: agent 侧自行接入（MCP 等），不经连接层转发
+         └─ 工具面（可选）: 进程内 mcp.WeComServer ⇄ 每 agent 会话
+              （agent 以 MCP 客户端身份接入，见下节）
 ```
 
 - `acp.NewRouter(...)` — 拉起 ACP 适配器子进程、完成 initialize 握手；
@@ -295,6 +300,53 @@ bot.Connect()
 - 完整示例见 `examples/acp-bot`（`ACP_COMMAND=pi-acp` 即可跑通 pi，
   前置配置见 [pi 文档](https://github.com/badlogic/pi-mono)：
   `~/.pi/agent/settings.json` 设 `quietStartup: true` 与默认模型）
+
+### 工具面（MCP）：让外部 agent 也能用企微丰富交互
+
+`llm` 内置模式的三个工具（`send_template_card` / `send_markdown` /
+`read_attachment`）同样可以暴露给 ACP 外部 agent：`mcp` 子包在进程内起一个
+仅回环监听的 MCP（Streamable HTTP）服务端，工具目录与执行器直接复用
+`llm.WeComToolDefs()` / `llm.NewWeComExecutor`——同一套能力，两种大脑。
+
+```
+mcp.WeComServer（127.0.0.1 随机端口, Bearer 提权）
+  └─ /mcp/<chatKey>  ← 每个企微会话一个独立端点
+       每 agent 会话的 cwd 目录里 .pi/mcp.json 指向该会话专属端点
+```
+
+- **每会话独立 URL（隔离）**：`acp.Router.EnableTools(surface, workDir)`
+  为每个新 agent 会话生成 `workDir/<chatKey>/.pi/mcp.json`，指向该会话
+  专属端点并以它为 session cwd——模型物理上够不到其他会话；工具参数
+  无需 `chat_id`，prompt 无需注入上下文头，会话历史保持干净
+- **快照生命周期**：工具只在当前消息处理在途时可用（执行器闭包绑定该
+  消息）；消息收尾后调用返回 `ok:false` 自纠文案，模型可据此调整
+- **凭据**：启动时生成随机 token，各端点常量时间校验，不打印到日志
+
+启用方式（`examples/acp-bot`）：
+
+```bash
+ACP_TOOLS=1 ACP_COMMAND=pi-acp go run ./examples/acp-bot
+# ACP_TOOL_WORKDIR 可覆盖会话目录基址（默认 ~/.wecom-aibot/acp-work，
+# 须跨重启稳定：pi 的 trust 决策按路径留存）
+```
+
+pi 注意事项：
+
+- 启动时自动把 workDir 根目录合并进 `~/.pi/agent/trust.json`（只增不改）——
+  项目级 `.pi/mcp.json` 仅在受信目录加载，而 pi 的 RPC 模式（pi-acp 用）
+  无法弹窗询问 trust，必须预先登记
+- pi 对 MCP 工具调用**默认不弹权限**（不走 `session/request_permission`，
+  也不受 `AgentConfig.Permission` / `ACP_ALLOW_TOOL` 覆盖）——工具面本就
+  只含企微发送/读取能力，无 fs/bash 面
+- 为什么不经 ACP 的 `session/new.mcpServers` 传工具面：pi-acp（v0.0.34）
+  收下该参数但不转发（上游已确认的已知限制），且 RPC 模式无对应方法；
+  项目级 MCP 配置是 pi 官方支持的现实路径
+
+其他 agent（如 Claude Code）同理可用各自的项目级 MCP 配置接入同一端点：
+
+```bash
+claude mcp add --transport http wecom <url> --header "Authorization: Bearer <token>"
+```
 
 ## 文件下载与解密
 
@@ -344,11 +396,13 @@ wecom-aibot-go/
   types.go          协议类型、常量与配置
   utils.go          req_id 生成
   llm/              大模型对接子包（OpenAI 兼容 + Anthropic + 流式桥 + 工具调用）
+  mcp/              进程内 MCP 服务端子包（ACP 模式的企微工具面，Streamable HTTP）
   acp/              外部 agent 桥接子包（ACP client + 会话路由 + 打字机桥）
   examples/main.go
   examples/production/main.go
   examples/llm-bot/main.go
   examples/acp-bot/main.go
+  examples/acp-bot/piconfig.go
   .github/workflows/ci.yml
   LICENSE
 ```
