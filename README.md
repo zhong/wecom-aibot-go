@@ -330,6 +330,13 @@ ACP_TOOLS=1 ACP_COMMAND=pi-acp go run ./examples/acp-bot
 # 须跨重启稳定：pi 的 trust 决策按路径留存）
 ```
 
+**agent 沙箱化部署**：pi 无内置沙箱且以启动账号全权限运行——面向全员开放的
+机器人必须把 agent 关进容器/microVM。`ACP_COMMAND` 换成 `docker` /
+`container` 包装 argv 即可（`acp.AgentConfig` 透传 stdio，连接层零改动），
+Apple container 路线下工具面用 `ACP_TOOL_ADDR` 直接监听容器网关（省掉
+宿主转发器）；方案对比、实测记录与运行形态见
+`docs/agent-sandbox-research.md` 与 `examples/acp-bot/SANDBOX.md`。
+
 pi 注意事项：
 
 - 启动时自动把 workDir 根目录合并进 `~/.pi/agent/trust.json`（只增不改）——
@@ -404,6 +411,9 @@ wecom-aibot-go/
   examples/llm-bot/main.go
   examples/acp-bot/main.go
   examples/acp-bot/piconfig.go
+  examples/acp-bot/SANDBOX.md  沙箱化 pi-agent 部署示例（docker / Apple container）
+  scripts/sandbox/     沙箱镜像 Dockerfile 与构建脚本（两种后端共用）
+  docs/                调研与集成文档（沙箱方案对比、连接层集成草图）
   .github/workflows/ci.yml
   LICENSE
 ```

@@ -28,6 +28,10 @@ type WeComServer struct {
 	tools  []mcpTool
 	server *http.Server
 	ln     net.Listener
+
+	// advertiseBase 非空时 URL() 用它代替实际监听地址作基址
+	//（SetAdvertiseBase；容器化 agent 部署里的 host.docker.internal 通告）。
+	advertiseBase string
 }
 
 // ToolSurface 是 acp 包集成所需的最小面（acp 单向依赖 mcp，不 import llm）。
@@ -86,12 +90,29 @@ func (s *WeComServer) Addr() string {
 	return s.ln.Addr().String()
 }
 
-// URL 返回服务端基址（如 "http://127.0.0.1:54321"）。
+// URL 返回服务端基址（如 "http://127.0.0.1:54321"）。设置过
+// SetAdvertiseBase 时返回通告基址（写 agent 配置用的可达地址）。
 func (s *WeComServer) URL() string {
+	if s.advertiseBase != "" {
+		return s.advertiseBase
+	}
 	if s.Addr() == "" {
 		return ""
 	}
 	return "http://" + s.Addr()
+}
+
+// SetAdvertiseBase 设置对外通告的基址，覆盖实际监听地址写进 agent 配置
+// （URL/URLFor 的返回值）。容器化 agent 部署里，服务端仍仅监听本机可达的
+// 地址（如 127.0.0.1），但容器取实际地址不可达——通告 host.docker.internal
+// 或容器网络网关等容器视角可达的基址，agent 配置里写出去的 URL 才通。
+// 须在写 agent 配置（EnableTools 后首个会话建立）前调用；
+// 前缀不带 scheme 时按 http 补全。
+func (s *WeComServer) SetAdvertiseBase(base string) {
+	if base != "" && !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+		base = "http://" + base
+	}
+	s.advertiseBase = base
 }
 
 // URLFor 返回 chatKey 专属的 MCP 端点。chatKey 经 PathEscape 编码进
