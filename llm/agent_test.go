@@ -169,6 +169,43 @@ func TestRunTurnRoundNotice(t *testing.T) {
 	}
 }
 
+func TestRunTurnFinalRoundOnly(t *testing.T) {
+	// FinalRoundOnly：成功路径只返回最后一轮正文；出错仍回全程累积。
+	client := &fakeLLM{rounds: []fakeRound{
+		{
+			deltas:    []string{"第一轮独白…"},
+			toolCalls: []ToolCall{{ID: "c1", Name: "send_template_card", Arguments: json.RawMessage(`{"card":{"card_type":"text_notice"}}`)}},
+		},
+		{deltas: []string{"已发出，请查收。"}},
+	}}
+	exec := &recordingExec{result: `{"ok":true}`}
+
+	var got []string
+	final, err := RunTurn(context.Background(), client, ChatRequest{}, exec.exec,
+		func(d string) error { got = append(got, d); return nil },
+		TurnOptions{FinalRoundOnly: true})
+	if err != nil {
+		t.Fatalf("RunTurn 失败: %v", err)
+	}
+	if final != "已发出，请查收。" {
+		t.Errorf("FinalRoundOnly 应只返回最后一轮正文: %q", final)
+	}
+	// 中间增量照常全程回调推送，不受净化影响
+	if strings.Join(got, "") != "第一轮独白…已发出，请查收。" {
+		t.Errorf("onDelta 应保持全程累积: %q", strings.Join(got, ""))
+	}
+
+	// 出错路径不作净化：半截全程文本随错误带回，由调用方闭环
+	client2 := &fakeLLM{rounds: []fakeRound{
+		{deltas: []string{"前半"}, roundErr: errAbort},
+	}}
+	final2, err := RunTurn(context.Background(), client2, ChatRequest{}, exec.exec,
+		func(string) error { return nil }, TurnOptions{FinalRoundOnly: true})
+	if final2 != "前半" {
+		t.Errorf("出错时应回退全程累积文本: %q", final2)
+	}
+}
+
 func TestRunTurnStreamErrorPropagates(t *testing.T) {
 	client := &fakeLLM{rounds: []fakeRound{
 		{deltas: []string{"半截"}, roundErr: errAbort},

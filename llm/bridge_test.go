@@ -460,6 +460,87 @@ func TestAgentReplyCardAndFinalFrame(t *testing.T) {
 	}
 }
 
+func TestAgentReplyFinalRoundOnly(t *testing.T) {
+	// 终帧净化：FinalRoundOnly 开启时终帧只携带最后一轮正文；
+	// 中间帧照常全程累积推送，不回退。
+	srv := newBotWSServer(t)
+	client := &fakeLLM{rounds: []fakeRound{
+		{
+			deltas:    []string{"正在生成值班卡片…"},
+			toolCalls: []ToolCall{{ID: "call_1", Name: "send_template_card", Arguments: json.RawMessage(`{"card":{"card_type":"text_notice"}}`)}},
+		},
+		{deltas: []string{"已发出，请查收。"}},
+	}}
+	done := make(chan string, 1)
+	connectBot(t, srv, func(bot *wecomaibot.Client, msg wecomaibot.TextMessage) {
+		streamID := wecomaibot.GenerateReqID("stream")
+		final, err := AgentReply(context.Background(), bot, msg, streamID, client,
+			ChatRequest{}, NewWeComExecutor(bot, msg), "正在思考...",
+			TurnOptions{FinalRoundOnly: true})
+		if err != nil {
+			t.Errorf("AgentReply 失败: %v", err)
+		}
+		done <- final
+	})
+	final := <-done
+	time.Sleep(200 * time.Millisecond)
+
+	frames := srv.streamFrames()
+	if len(frames) < 3 {
+		t.Fatalf("流式帧过少: %d", len(frames))
+	}
+	// 中间帧（占位之后）携带全程累积文本，不被净化截断
+	if frames[1].Content != "正在生成值班卡片…" {
+		t.Errorf("中间帧应携带第一轮累积文本: %+v", frames[1])
+	}
+	// 终帧只携带最后一轮正文
+	last := frames[len(frames)-1]
+	if !last.Finish || last.Content != "已发出，请查收。" {
+		t.Errorf("终帧应只携带最后一轮正文: %+v", last)
+	}
+	if final != "已发出，请查收。" {
+		t.Errorf("finalText = %q, 期望净化后的最后一轮文本", final)
+	}
+}
+
+func TestAgentReplyFinalRoundOnlyEmptyLastRound(t *testing.T) {
+	// 最后一轮为空（模型只在工具轮说过话）：终帧退回已推送的累积文本，
+	// 不能比用户已见的更少。
+	srv := newBotWSServer(t)
+	client := &fakeLLM{rounds: []fakeRound{
+		{
+			deltas:    []string{"看一下，随后发卡片。"},
+			toolCalls: []ToolCall{{ID: "call_1", Name: "send_template_card", Arguments: json.RawMessage(`{"card":{"card_type":"text_notice"}}`)}},
+		},
+		{}, // 第二轮无文本无工具
+	}}
+	done := make(chan string, 1)
+	connectBot(t, srv, func(bot *wecomaibot.Client, msg wecomaibot.TextMessage) {
+		streamID := wecomaibot.GenerateReqID("stream")
+		final, err := AgentReply(context.Background(), bot, msg, streamID, client,
+			ChatRequest{}, NewWeComExecutor(bot, msg), "正在思考...",
+			TurnOptions{FinalRoundOnly: true})
+		if err != nil {
+			t.Errorf("AgentReply 失败: %v", err)
+		}
+		done <- final
+	})
+	final := <-done
+	time.Sleep(200 * time.Millisecond)
+
+	frames := srv.streamFrames()
+	if len(frames) == 0 {
+		t.Fatal("没有流式帧, 未闭环")
+	}
+	last := frames[len(frames)-1]
+	if !last.Finish || last.Content != "看一下，随后发卡片。" {
+		t.Errorf("末轮为空时终帧应退回累积文本: %+v", last)
+	}
+	if final != "看一下，随后发卡片。" {
+		t.Errorf("finalText = %q", final)
+	}
+}
+
 func TestAgentReplyErrorClosesStream(t *testing.T) {
 	// 第一轮流中途出错：已有内容则带内容发终帧，流闭环且错误上抛。
 	srv := newBotWSServer(t)

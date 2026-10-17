@@ -103,6 +103,10 @@ func StreamReply(ctx context.Context, bot *wecomaibot.Client, req wecomaibot.Req
 // （如发卡片）穿插在流式帧之间，文本增量照常打字机推送。返回终帧实际发出的
 // 完整文本，卡片操作等结构化输出不包含其中（它们作为独立卡片消息送达）。
 //
+// turnOpts.FinalRoundOnly 开启终帧净化：正常结束时终帧只携带最后一轮正文，
+// 工具轮的中间独白不进终稿；中间帧保持全程累积不回退。最后一轮为空时
+// （模型只在前面的工具轮说过话）退回已推送的累积文本，保证终帧不缺内容。
+//
 // update_template_card 类「更新已有卡片」的能力不在工具目录内：卡片事件后
 // 只有 5 秒更新窗口，一次 LLM 往返不可达；应通过 OnTemplateCardEvent
 // 处理器确定性更新（见 examples/llm-bot）。
@@ -115,11 +119,17 @@ func AgentReply(ctx context.Context, bot *wecomaibot.Client, req wecomaibot.Requ
 		return "", err
 	}
 
-	_, turnErr := RunTurn(ctx, client, chatReq, exec, func(delta string) error {
+	runResult, turnErr := RunTurn(ctx, client, chatReq, exec, func(delta string) error {
 		return b.push(delta)
 	}, turnOpts)
 
-	finalText = b.content
+	// FinalRoundOnly 开启时 runResult 只是最后一轮正文；为空（模型只在
+	// 工具轮出过文本）则退回本回合已推送的累积文本，终帧内容不能比用户
+	// 已见的更少。
+	finalText = runResult
+	if finalText == "" {
+		finalText = b.content
+	}
 	switch {
 	case turnErr != nil && finalText == "":
 		finalText = DefaultErrorText

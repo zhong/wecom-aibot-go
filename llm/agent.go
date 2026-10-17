@@ -25,6 +25,11 @@ type TurnOptions struct {
 	// RoundNotice 非空时在每轮工具执行完后作为文本增量回传一次
 	// （如 "正在操作卡片…"），并计入最终文本。
 	RoundNotice string
+	// FinalRoundOnly 开启终帧净化：成功结束时返回值只携带最后一轮
+	// （不再调工具的那一轮）的正文，工具轮的中间文本不再混进终稿。
+	// 中间帧仍按全程累积推送不受影响；出错或轮数耗尽时出于保底
+	// 回退为全程累积文本（用户已看到的内容不能凭空消失）。
+	FinalRoundOnly bool
 }
 
 // toolUnavailable 是 exec 为空时的占位执行器：把"工具不可用"喂回模型。
@@ -35,7 +40,11 @@ func toolUnavailable(context.Context, string, json.RawMessage) (string, error) {
 // RunTurn 执行多轮「模型 → 工具 → 模型」循环：模型流式产出文本
 // （经 onDelta 实时回调，企微桥用它推流式帧）；若模型发起工具调用，
 // 逐个执行、把结果作为 role "tool" 消息回喂，继续下一轮，直到模型
-// 不再调用工具。返回全程累积的文本。
+// 不再调用工具。
+//
+// 返回值策略：默认返回全程累积文本；TurnOptions.FinalRoundOnly 开启时
+// 成功结束只返回最后一轮的正文（终帧净化，中间文本不进终稿），出错或
+// 轮数耗尽则回退为全程累积文本。
 //
 //   - 工具执行错误不中止循环：错误转成文本结果喂回模型，让它自行调整。
 //   - ctx 取消/LLM 错误立即返回，已累积的文本随返回值带回，由调用方闭环。
@@ -53,6 +62,9 @@ func RunTurn(ctx context.Context, client Client, chatReq ChatRequest, exec ToolE
 
 	msgs := append([]ChatMessage(nil), chatReq.Messages...)
 	var full strings.Builder
+	// lastRoundText：最后一轮（不再调工具的那一轮）的正文；FinalRoundOnly
+	// 成功路径返回它，其余路径回退 full。
+	var lastRoundText string
 
 	for round := 0; round < maxRounds; round++ {
 		r := chatReq
@@ -80,6 +92,10 @@ func RunTurn(ctx context.Context, client Client, chatReq ChatRequest, exec ToolE
 
 		if len(toolCalls) == 0 {
 			// 模型不再调用工具：本轮文本即最终回复。
+			lastRoundText = roundText.String()
+			if opts.FinalRoundOnly {
+				return lastRoundText, nil
+			}
 			return full.String(), nil
 		}
 		if round == maxRounds-1 {

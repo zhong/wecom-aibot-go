@@ -225,17 +225,22 @@ go run ./examples/llm-bot
 ### 工具调用：让模型自主使用企微丰富交互
 
 `llm` 包支持工业界标准的工具调用（Tool Calling）：把企微交互能力注册成工具，
-连同 JSON Schema 发给模型，由模型自行决定何时发模板卡片、何时发 markdown
-补充消息；SDK 侧执行工具后把结果回喂模型，循环直到模型给出最终回复。
+连同 JSON Schema 发给模型，由模型按内容形态自主决定何时发模板卡片、何时发
+markdown 补充消息、何时直接文本回复、何时先读用户附件再作答——不需要用户
+明确要求；SDK 侧执行工具后把结果回喂模型，循环直到模型给出最终回复。
 
 - `ChatRequest.Tools` / `llm.ToolDef` / `llm.StreamChatEvents`（`StreamChat`
   保持兼容，只回调文本增量）
 - `llm.RunTurn(...)` — 多轮「模型 → 工具 → 模型」循环（默认最多 5 轮，
-  工具执行失败会作为结果回喂模型自行调整）
+  工具执行失败会作为结果回喂模型自行调整；`TurnOptions.FinalRoundOnly`
+  开启终帧净化——成功时终帧只携带最后一轮正文，中间帧保持全程累积）
 - `llm.AgentReply(...)` — 带工具循环的流式桥，帧闭环与 `StreamReply` 一致
-- `llm.WeComToolDefs()` / `llm.NewWeComExecutor(bot, msg)` — 内置工具目录
-  （`send_template_card` / `send_markdown`）与执行器；目标会话由执行器闭包
-  绑定当前消息，模型无法伪造投递目标
+- `llm.WeComToolDefs()` / `llm.NewWeComExecutor(bot, msg)` — 内置工具目录与
+  执行器；目标会话由执行器闭包绑定当前消息，模型无法伪造投递目标：
+  - `send_template_card` — 发模板卡片（通知/数据展示/用户交互类内容）
+  - `send_markdown` — 补充发送格式化长文本（表格、多层列表等）
+  - `read_attachment` — 读取用户消息携带的附件（自动下载并 AES 解密，
+    文本类附件回喂内容预览，图片/音视频回喂元信息）
 
 ```go
 chatReq := llm.ChatRequest{
@@ -243,12 +248,15 @@ chatReq := llm.ChatRequest{
     Tools: llm.WeComToolDefs(),
 }
 final, err := llm.AgentReply(ctx, bot, msg, wecomaibot.GenerateReqID("stream"),
-    client, chatReq, llm.NewWeComExecutor(bot, msg), "正在思考...", llm.TurnOptions{})
+    client, chatReq, llm.NewWeComExecutor(bot, msg), "正在思考...", llm.TurnOptions{
+        FinalRoundOnly: true, // 终帧净化：只携带最后一轮正文
+    })
 ```
 
-> 注意：`update_template_card` 有意不在工具目录内——卡片事件后只有 5 秒
-> 更新窗口，一次 LLM 往返不可达；卡片更新应在 `OnTemplateCardEvent`
-> 处理器里确定性完成（见 `examples/llm-bot`）。
+> 注意：`update_template_card` 与 `reply_welcome` 有意不在工具目录内——
+> 两者分别要在卡片事件/enter_chat 事件后 5 秒窗口内完成，一次 LLM 往返
+> 不可达；应在对应的 `OnTemplateCardEvent` / `OnEnterChat` 处理器里
+> 确定性完成（见 `examples/llm-bot`）。
 
 ## 文件下载与解密
 
