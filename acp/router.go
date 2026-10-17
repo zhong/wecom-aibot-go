@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	wecomaibot "github.com/zhong/wecom-aibot-go"
+	"github.com/zhong/wecom-aibot-go/llm"
 	"github.com/zhong/wecom-aibot-go/mcp"
 )
 
@@ -130,6 +131,22 @@ func RouterBind(bot *wecomaibot.Client, r *Router) {
 			}
 		}
 	}
+	// saveInflight 把在途附件落盘到该会话 agent 的 cwd，返回 prompt 后缀：
+	// pi-acp 0.0.34 的 RPC 模式不加载 MCP 客户端（模型知道工具名但手
+	// 上没有可调用的工具），不落盘的话模型只能满文件系统盲找。落盘失败
+	// 时退回 read_attachment 引导（本机 MCP 客户端形态仍可用）。
+	saveInflight := func(req wecomaibot.RequestCarrier) string {
+		chatKey := chatKeyOfReq(req)
+		cwd := r.sessionCwd(chatKey)
+		if cwd == "" {
+			return attachmentHint
+		}
+		path, err := llm.SaveInflightAttachment(context.Background(), r.bot, req, cwd)
+		if err != nil || path == "" {
+			return attachmentHint
+		}
+		return "\n[附件已保存到 " + path + "，可直接读取该文件]"
+	}
 	bot.OnText(func(ctx context.Context, m wecomaibot.TextMessage) {
 		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, textWithQuoteHint(m.Text.Content, m.Quote))
 	})
@@ -138,13 +155,13 @@ func RouterBind(bot *wecomaibot.Client, r *Router) {
 		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, m.Voice.Content)
 	})
 	bot.OnImage(func(ctx context.Context, m wecomaibot.ImageMessage) {
-		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, "[用户发来一张图片]")
+		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, "[用户发来一张图片]"+saveInflight(m))
 	})
 	bot.OnVideo(func(ctx context.Context, m wecomaibot.VideoMessage) {
-		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, "[用户发来一段视频]")
+		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, "[用户发来一段视频]"+saveInflight(m))
 	})
 	bot.OnFile(func(ctx context.Context, m wecomaibot.FileMessage) {
-		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, "[用户发来文件]")
+		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, "[用户发来文件]"+saveInflight(m))
 	})
 	bot.OnMixed(func(ctx context.Context, m wecomaibot.MixedMessage) {
 		var sb []byte
@@ -157,6 +174,13 @@ func RouterBind(bot *wecomaibot.Client, r *Router) {
 		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, string(sb))
 	})
 }
+
+// attachmentHint 是直发附件消息的 prompt 后缀：直发的图片/文件/视频
+// 只带占位正文（"[用户发来文件]"），不提示的话 agent 会在文件系统里
+// 盲找落盘文件（实测踩坑）。附件本体由 read_attachment 工具从消息
+// 载体按需读取——工具面未启用时该提示无效但不致误导（agent 会在会话
+// 历史里看到同样的提示句历史，回复里说明无工具即可）。
+const attachmentHint = "\n[附件本体经 read_attachment 工具读取，先调它拿到内容]"
 
 // textWithQuoteHint 组装文本消息的 prompt：群聊里独立图片/文件不产生
 // 回调，用户会以「引用附件 @机器人」的方式送达附件——给 agent 一句提示，
@@ -177,6 +201,27 @@ func chatKeyOf(base wecomaibot.BaseMessage, userID string) string {
 		return base.ChatID
 	}
 	return "dm:" + userID
+}
+
+// chatKeyOfReq 从任意消息载体生成路由键（与 chatKeyOf 同语义）。
+func chatKeyOfReq(req wecomaibot.RequestCarrier) string {
+	switch m := req.(type) {
+	case wecomaibot.TextMessage:
+		return chatKeyOf(m.BaseMessage, m.From.UserID)
+	case wecomaibot.VoiceMessage:
+		return chatKeyOf(m.BaseMessage, m.From.UserID)
+	case wecomaibot.ImageMessage:
+		return chatKeyOf(m.BaseMessage, m.From.UserID)
+	case wecomaibot.VideoMessage:
+		return chatKeyOf(m.BaseMessage, m.From.UserID)
+	case wecomaibot.FileMessage:
+		return chatKeyOf(m.BaseMessage, m.From.UserID)
+	case wecomaibot.MixedMessage:
+		return chatKeyOf(m.BaseMessage, m.From.UserID)
+	case wecomaibot.EventMessage:
+		return chatKeyOf(wecomaibot.BaseMessage{ChatID: m.ChatID, ReqID: m.ReqID}, "")
+	}
+	return ""
 }
 
 // initializeSession 在已有 initialize 握手之后新建一个 agent 会话，

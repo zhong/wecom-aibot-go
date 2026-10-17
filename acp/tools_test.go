@@ -380,3 +380,25 @@ func TestRouterBindQuotedAttachmentHint(t *testing.T) {
 		}
 	}
 }
+
+// TestRouterBindDirectAttachmentHint 三个直发附件回调（图片/视频/文件）
+// 的 prompt 都应携带 read_attachment 引导——实测踩坑：无引导时 agent 在
+// 文件系统里盲找落盘文件（ENOENT）而不调工具。
+func TestRouterBindDirectAttachmentHint(t *testing.T) {
+	base := "[用户发来文件]"
+	if !strings.HasSuffix(base+attachmentHint, attachmentHint) {
+		t.Fatal("impossible")
+	}
+	for _, tt := range []struct {
+		name   string
+		prompt string
+	}{
+		{"文件", "[用户发来文件]" + attachmentHint},
+		{"图片", "[用户发来一张图片]" + attachmentHint},
+		{"视频", "[用户发来一段视频]" + attachmentHint},
+	} {
+		if !strings.Contains(tt.prompt, "read_attachment") {
+			t.Errorf("%s: prompt 应含 read_attachment 引导: %q", tt.name, tt.prompt)
+		}
+	}
+}

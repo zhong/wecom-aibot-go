@@ -270,6 +270,30 @@ type reqAttachment struct {
 	msgType string // 附件来源的消息类型（file/image/voice/video/mixed）
 }
 
+// SaveInflightAttachment 把在途消息携带的附件下载并落盘到 dir（返回
+// 绝对路径），供连接层把附件直接交给外部 agent 的会话目录——agent 无
+// MCP 工具能力时（如 pi-acp RPC 模式不加载 MCP 客户端）也能直接读文件。
+// 带附件与尺寸校验同 execReadAttachment；无附件返回 ""、nil。
+func SaveInflightAttachment(ctx context.Context, bot *wecomaibot.Client, req wecomaibot.RequestCarrier, dir string) (string, error) {
+	attachment, ok := attachmentOf(req)
+	if !ok {
+		return "", nil
+	}
+	downloaded, err := bot.DownloadFile(attachment.url, attachment.aesKey)
+	if err != nil {
+		return "", fmt.Errorf("下载附件失败: %w", err)
+	}
+	if len(downloaded.Buffer) > readAttachmentMaxSize {
+		return "", fmt.Errorf("附件过大（%d 字节，超过 %d MiB 上限）",
+			len(downloaded.Buffer), readAttachmentMaxSize/1024/1024)
+	}
+	p, err := saveAttachment(dir, downloaded.Filename, downloaded.Buffer)
+	if err != nil {
+		return "", fmt.Errorf("保存附件失败: %w", err)
+	}
+	return p, nil
+}
+
 // attachmentOf 判断消息是否携带附件并提取 url/aeskey。图文混排取首个
 // 携带 url 的项；引用消息（群聊 @机器人引用图片的用户文本）取被引用
 // 载荷里的附件——群聊里独立图片消息不产生回调，引用是官方可达路径；
