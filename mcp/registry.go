@@ -7,9 +7,11 @@ import (
 )
 
 // chatEntry 是一个在途消息的快照：req 是触发本轮 prompt 的消息载体
-// （流式回复 req_id 与附件上下文的来源）。
+// （流式回复 req_id 与附件上下文的来源），saveDir 是该会话 agent 的
+// cwd（二进制附件落盘目录，可为空）。
 type chatEntry struct {
-	req wecomaibot.RequestCarrier
+	req     wecomaibot.RequestCarrier
+	saveDir string
 }
 
 // registry 维护 chatKey → 在途消息快照。SetChat 在一条消息的 prompt
@@ -25,9 +27,9 @@ func newRegistry() *registry {
 }
 
 // set 登记快照；同 chatKey 覆盖。
-func (r *registry) set(chatKey string, req wecomaibot.RequestCarrier) {
+func (r *registry) set(chatKey string, req wecomaibot.RequestCarrier, saveDir string) {
 	r.mu.Lock()
-	r.m[chatKey] = chatEntry{req: req}
+	r.m[chatKey] = chatEntry{req: req, saveDir: saveDir}
 	r.mu.Unlock()
 }
 

@@ -45,7 +45,19 @@ func NewRouter(ctx context.Context, bot *wecomaibot.Client, cfg AgentConfig) (*R
 
 // entry 取（或惰性创建）一个企微会话的路由条目。启用工具面时，每个新
 // 会话各建一个专属 cwd 目录（其 .pi/mcp.json 指向会话专属 MCP 端点，
-// 由 enableSessionTools 完成）。
+// 由 enableSessionTools 完成）。返回的条目携带该会话的 agent cwd
+// （工具面附件落盘目录；未启用时为空）。
+
+// sessionCwd 返回该会话 agent 的 cwd：启用工具面时是 workDir 下的专属
+// 目录（附件落盘/项目配置都在这里），否则空。
+func (r *Router) sessionCwd(chatKey string) string {
+	surface, workDir := r.toolSurface()
+	if surface == nil {
+		return ""
+	}
+	return sessionWorkDir(workDir, chatKey)
+}
+
 func (r *Router) entry(chatKey string) (*sessionEntry, error) {
 	// 工具面状态惰性快照：entry 持 Router.mu 串行读，Handle 不会与
 	// EnableTools 并发（EnableTools 须在首条消息前调用，文档已注明）。
@@ -89,10 +101,10 @@ func (r *Router) Handle(ctx context.Context, chatKey string, req wecomaibot.Requ
 	defer func() { <-e.mu }()
 
 	// 工具面：prompt 在途期间把消息载体快照登进 MCP 端点（agent 由此连到
-	// 本会话的执行上下文）。defer 在释放串行锁前清除（LIFO），同会话的
-	// 下一条消息不可能读到别的快照。
+	// 本会话的执行上下文；saveDir 传会话 cwd，附件落盘写到 agent 能读的地方）。
+	// defer 在释放串行锁前清除（LIFO），同会话的下一条消息不可能读到别的快照。
 	if surface, _ := r.toolSurface(); surface != nil {
-		surface.SetChat(chatKey, req)
+		surface.SetChat(chatKey, req, r.sessionCwd(chatKey))
 		defer surface.ClearChat(chatKey)
 	}
 

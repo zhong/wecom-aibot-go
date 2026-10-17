@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"unicode/utf8"
 
@@ -76,10 +78,17 @@ func WeComToolDefs() []ToolDef {
 				"附件且内容对回答有必要——例如用户发来一份名单文件让你统计、或引用一张图片" +
 				"让你看图作答——就先调用本工具拿到附件信息再作答，不要凭空猜测附件内容。" +
 				"文本类附件（txt/csv/md/json 等）返回文本内容预览；图片/音视频等二进制附件" +
-				"返回文件名与大小等元信息。无需参数：读取目标由当前消息决定。",
+				"返回文件名与大小等元信息。读取目标由当前消息决定。" +
+				"save：置 true 时把二进制附件（图片/音视频等）保存为本地文件并在结果里" +
+				"返回 saved 绝对路径，需要直接查看/处理附件本体（如看图）时置 true。",
 			Parameters: map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
+				"type": "object",
+				"properties": map[string]any{
+					"save": map[string]any{
+						"type":        "boolean",
+						"description": "是否把二进制附件落盘为本地文件（返回 saved 路径）",
+					},
+				},
 			},
 		},
 	}
@@ -89,6 +98,14 @@ func WeComToolDefs() []ToolDef {
 // 回调载体，卡片优先原路回复（与流式帧天然串行）；chatID（由 req 提取）
 // 可得时可作为主动发送的目标。两者都不可得则返回错误结果，模型可见。
 func NewWeComExecutor(bot *wecomaibot.Client, req wecomaibot.RequestCarrier) ToolExecutor {
+	return NewWeComExecutorCwd(bot, req, "")
+}
+
+// NewWeComExecutorCwd 构造带附件落盘目录的执行器：saveDir 是外部 agent 的
+// 会话 cwd（ACP 模式），非空且模型在 read_attachment 参数里 save=true 时，
+// 二进制附件落盘到该目录并在结果里返回 saved 本地路径——带视觉能力的
+// agent 可直接读取图片。saveDir 为空时行为与 NewWeComExecutor 完全一致。
+func NewWeComExecutorCwd(bot *wecomaibot.Client, req wecomaibot.RequestCarrier, saveDir string) ToolExecutor {
 	chatID := extractChatID(req)
 	return func(ctx context.Context, name string, args json.RawMessage) (string, error) {
 		switch name {
@@ -97,7 +114,7 @@ func NewWeComExecutor(bot *wecomaibot.Client, req wecomaibot.RequestCarrier) Too
 		case "send_markdown":
 			return execSendMarkdown(bot, req, chatID, args)
 		case "read_attachment":
-			return execReadAttachment(ctx, bot, req)
+			return execReadAttachment(ctx, bot, req, args, saveDir)
 		default:
 			return "", fmt.Errorf("未知工具: %s", name)
 		}
@@ -175,12 +192,18 @@ const readAttachmentMaxSize = 10 * 1024 * 1024
 
 // execReadAttachment 执行 read_attachment：从 req 载体提取附件（url+aeskey），
 // 经 DownloadFile 下载（aeskey 可得时 AES 解密）。文本类返回截断内容预览，
-// 二进制（图片/音视频等）返回文件名与大小元信息；无附件返回明确结果。
-func execReadAttachment(ctx context.Context, bot *wecomaibot.Client, req wecomaibot.RequestCarrier) (string, error) {
+// 二进制（图片/音视频等）返回文件名与大小元信息；saveDir 非空且参数 save
+// 为 true 时二进制附件落盘到 saveDir，结果携带 saved 本地路径（外部 agent
+// 如 pi 可用视觉/本地工具直接读取）；无附件返回明确结果。
+func execReadAttachment(ctx context.Context, bot *wecomaibot.Client, req wecomaibot.RequestCarrier, argsRaw json.RawMessage, saveDir string) (string, error) {
 	attachment, ok := attachmentOf(req)
 	if !ok {
 		return toolResultJSON(false, 0, "当前消息没有附件"), nil
 	}
+	var args struct {
+		Save bool `json:"save"`
+	}
+	_ = json.Unmarshal(argsRaw, &args)
 	downloaded, err := bot.DownloadFile(attachment.url, attachment.aesKey)
 	if err != nil {
 		return toolResultJSON(false, 0, "下载附件失败: "+err.Error()), nil
@@ -201,7 +224,43 @@ func execReadAttachment(ctx context.Context, bot *wecomaibot.Client, req wecomai
 		}
 		return attachmentTextJSON(downloaded.Filename, len(downloaded.Buffer), preview, truncated), nil
 	}
-	return attachmentMetaJSON(downloaded.Filename, attachment.msgType, len(downloaded.Buffer)), nil
+	savePath := ""
+	if args.Save && saveDir != "" {
+		p, err := saveAttachment(saveDir, downloaded.Filename, downloaded.Buffer)
+		if err != nil {
+			return toolResultJSON(false, 0, "保存附件失败: "+err.Error()), nil
+		}
+		savePath = p
+	}
+	return attachmentMetaJSON(downloaded.Filename, attachment.msgType, len(downloaded.Buffer), savePath), nil
+}
+
+// saveAttachment 把附件内容落盘到 dir（Agent 会话 cwd），文件名取下载
+// 的原始文件名（无扩展名时按内容补一个），返回绝对路径。幂等：同名覆盖。
+func saveAttachment(dir, filename string, buf []byte) (string, error) {
+	if filename == "" || filename == "." || filename == ".." || strings.ContainsAny(filename, `/\`) {
+		// 服务端没给可信文件名（或带路径）：按内容类型起一个
+		ext := ""
+		switch {
+		case bytes.HasPrefix(buf, []byte("\x89PNG")):
+			ext = ".png"
+		case bytes.HasPrefix(buf, []byte("\xFF\xD8")):
+			ext = ".jpg"
+		case bytes.HasPrefix(buf, []byte("GIF8")):
+			ext = ".gif"
+		case bytes.HasPrefix(buf, []byte("RIFF")):
+			ext = ".webp"
+		}
+		filename = "attachment" + ext
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	p := filepath.Join(dir, filename)
+	if err := os.WriteFile(p, buf, 0o600); err != nil {
+		return "", err
+	}
+	return p, nil
 }
 
 // reqAttachment 是从消息载体提取出的单个附件。
@@ -311,18 +370,25 @@ func attachmentTextJSON(filename string, size int, preview string, truncated boo
 	return string(b)
 }
 
-// attachmentMetaJSON 拼二进制附件的元信息返回：模型据此说明收到了什么。
-func attachmentMetaJSON(filename, msgType string, size int) string {
-	b, _ := json.Marshal(map[string]any{
+// attachmentMetaJSON 拼二进制附件的元信息返回：body 可选携带落盘路径
+// （savePath 非空时），agent 可用该路径以视觉/本地工具直接读取文件。
+func attachmentMetaJSON(filename, msgType string, size int, savePath string) string {
+	out := map[string]any{
 		"ok":       true,
 		"type":     msgType,
 		"filename": filename,
 		"size":     size,
 		"note":     "二进制内容，请依据消息类型（图片/语音/视频）与文件名等信息作答",
-	})
+	}
+	if savePath != "" {
+		out["saved"] = savePath
+		out["note"] = "二进制内容已保存为本地文件，可直接读取该路径（如查看图片）"
+	}
+	b, _ := json.Marshal(out)
 	return string(b)
 }
 
+// attachmentMetaJSON 拼二进制附件的元信息返回：模型据此说明收到了什么。
 // toolResultJSON 拼回喂给模型的工具结果（ok/errmsg 的 JSON 字符串）。
 func toolResultJSON(ok bool, errcode int, errmsg string) string {
 	b, _ := json.Marshal(map[string]any{

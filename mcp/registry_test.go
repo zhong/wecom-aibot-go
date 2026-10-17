@@ -19,7 +19,7 @@ func TestRegistrySetGetClear(t *testing.T) {
 	if _, ok := r.get("chat_1"); ok {
 		t.Fatal("空注册表不应命中")
 	}
-	r.set("chat_1", newCarrier("chat_1"))
+	r.set("chat_1", newCarrier("chat_1"), "")
 	e, ok := r.get("chat_1")
 	if !ok {
 		t.Fatal("set 后应命中")
@@ -28,7 +28,7 @@ func TestRegistrySetGetClear(t *testing.T) {
 		t.Errorf("快照载体不对: %v", e.req.RequestID())
 	}
 	// 同键覆盖
-	r.set("chat_1", newCarrier("over"))
+	r.set("chat_1", newCarrier("over"), "")
 	if e, _ := r.get("chat_1"); e.req.RequestID() != "req_over" {
 		t.Errorf("同键应覆盖: %v", e.req.RequestID())
 	}
@@ -50,7 +50,7 @@ func TestRegistryConcurrent(t *testing.T) {
 			defer wg.Done()
 			key := "chat_" + string(rune('a'+i))
 			for j := 0; j < 200; j++ {
-				r.set(key, newCarrier(key))
+				r.set(key, newCarrier(key), "")
 				r.get(key)
 				r.get("other")
 				if j%3 == 0 {

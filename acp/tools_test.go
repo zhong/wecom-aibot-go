@@ -300,10 +300,12 @@ type mcpServerStub struct {
 	calls []string
 }
 
-func (s *mcpServerStub) SetChat(string, wecomaibot.RequestCarrier) { s.calls = append(s.calls, "set") }
-func (s *mcpServerStub) ClearChat(string)                          { s.calls = append(s.calls, "clear") }
-func (s *mcpServerStub) URLFor(string) string                      { return "http://127.0.0.1:1/mcp/x" }
-func (s *mcpServerStub) HeadersFor(string) map[string]string       { return nil }
+func (s *mcpServerStub) SetChat(string, wecomaibot.RequestCarrier, string) {
+	s.calls = append(s.calls, "set")
+}
+func (s *mcpServerStub) ClearChat(string)                    { s.calls = append(s.calls, "clear") }
+func (s *mcpServerStub) URLFor(string) string                { return "http://127.0.0.1:1/mcp/x" }
+func (s *mcpServerStub) HeadersFor(string) map[string]string { return nil }
 
 // TestHandleSnapshotLifecycle 帧 Handle 的 Set→ask→Clear 时序：
 // 未启用时无 Set/Clear；启用后每条消息先 Set 后 Clear，顺序恒定。

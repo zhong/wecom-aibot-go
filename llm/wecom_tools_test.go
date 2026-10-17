@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -246,5 +247,91 @@ func TestQuotedAttachmentReadAttachment(t *testing.T) {
 	r4, _ := NewWeComExecutor(bot, quoteText)(context.Background(), "read_attachment", json.RawMessage(`{}`))
 	if !strings.Contains(r4, "没有附件") {
 		t.Errorf("引用纯文本不应有附件: %s", r4)
+	}
+}
+
+// TestReadAttachmentSaveToDir read_attachment 的 save=true 落盘路径：
+// 二进制附件（PNG 头）保存到 saveDir，结果带 saved 绝对路径与明确 note；
+// save=false / 无参数时行为不变（只有元信息、无 saved 字段）。
+func TestReadAttachmentSaveToDir(t *testing.T) {
+	bot, err := wecomaibot.NewClient(wecomaibot.Config{
+		BotID: "bot", Secret: "secret", WSURL: newBotWSServer(t).url(),
+		HeartbeatIntervalMS: 60000, Logger: silentLogger{},
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	png := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 64)...)
+	dlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(png)
+	}))
+	t.Cleanup(dlSrv.Close)
+
+	msg := wecomaibot.TextMessage{}
+	msg.ReqID = "req_s1"
+	msg.ChatID = "chat_1"
+	msg.Text.Content = "看下这张图"
+	msg.Quote = &wecomaibot.QuoteContent{MsgType: "image",
+		Image: &wecomaibot.ImageContent{URL: dlSrv.URL}}
+	saveDir := t.TempDir()
+
+	// save=true：落盘 + saved 路径
+	exec := NewWeComExecutorCwd(bot, msg, saveDir)
+	r, err := exec(context.Background(), "read_attachment", json.RawMessage(`{"save":true}`))
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	var saved struct {
+		Ok    bool   `json:"ok"`
+		Type  string `json:"type"`
+		Saved string `json:"saved"`
+	}
+	if err := json.Unmarshal([]byte(r), &saved); err != nil {
+		t.Fatalf("解析结果失败: %v（%s）", err, r)
+	}
+	if !saved.Ok || saved.Type != "image" || saved.Saved == "" {
+		t.Fatalf("save=true 应返回 saved 路径: %s", r)
+	}
+	buf, err := os.ReadFile(saved.Saved)
+	if err != nil || !bytes.HasPrefix(buf, []byte("\x89PNG")) {
+		t.Errorf("落盘文件应可读且为 PNG 内容: path=%s err=%v", saved.Saved, err)
+	}
+	if !strings.Contains(r, "已保存为本地文件") {
+		t.Errorf("note 应说明已落盘: %s", r)
+	}
+
+	// save 不传：行为不变，无 saved 字段
+	r2, err := exec(context.Background(), "read_attachment", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if strings.Contains(r2, "saved") {
+		t.Errorf("未请求 save 不应落盘: %s", r2)
+	}
+
+	// saveDir 为空（llm 模式）：save=true 也只有元信息，不报错
+	exec2 := NewWeComExecutor(bot, msg)
+	r3, err := exec2(context.Background(), "read_attachment", json.RawMessage(`{"save":true}`))
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if strings.Contains(r3, "saved") {
+		t.Errorf("saveDir 为空不应有 saved: %s", r3)
+	}
+
+	// 文本类附件不受 save 影响（内容预览就是全文）
+	fdlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("张三,李四"))
+	}))
+	t.Cleanup(fdlSrv.Close)
+	fq := msg
+	fq.Quote = &wecomaibot.QuoteContent{MsgType: "file",
+		File: &wecomaibot.FileContent{URL: fdlSrv.URL}}
+	r4, err := NewWeComExecutorCwd(bot, fq, saveDir)(context.Background(), "read_attachment", json.RawMessage(`{"save":true}`))
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if !strings.Contains(r4, "张三") || strings.Contains(r4, "saved") {
+		t.Errorf("文本类附件应照常内容预览: %s", r4)
 	}
 }

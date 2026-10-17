@@ -232,7 +232,14 @@ func (e *testEnv) clientFor(chatKey string) *mcpClient {
 // 返回工具结果文本。
 func (e *testEnv) runInChat(t *testing.T, chatKey string, req wecomaibot.RequestCarrier, tool, args string) string {
 	t.Helper()
-	e.mcp.SetChat(chatKey, req)
+	return e.runInChatSave(t, chatKey, req, tool, args, "")
+}
+
+// runInChatSave 同 runInChat 但带附件落盘目录（saveDir 传给 SetChat，
+// read_attachment save=true 时二进制附件写到该目录）。
+func (e *testEnv) runInChatSave(t *testing.T, chatKey string, req wecomaibot.RequestCarrier, tool, args, saveDir string) string {
+	t.Helper()
+	e.mcp.SetChat(chatKey, req, saveDir)
 	defer e.mcp.ClearChat(chatKey)
 	c := e.clientFor(chatKey)
 	var arguments any
@@ -500,5 +507,44 @@ func TestChatKeyEscapeRoundTrip(t *testing.T) {
 		if err != nil || got != key {
 			t.Errorf("往返失败: %q → %q → %q (err=%v)", key, esc, got, err)
 		}
+	}
+}
+
+// TestToolsCallReadAttachmentSave 通过 saveDir（会话 cwd）+ save=true 的
+// read_attachment：二进制附件落盘到 saveDir，结果返回 saved 绝对路径，
+// agent 可用视觉/本地工具直接读取。
+func TestToolsCallReadAttachmentSave(t *testing.T) {
+	e := newTestEnv(t, "")
+	png := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 32)...)
+	var pngLen int
+	dlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Disposition", `attachment; filename="photo.png"`)
+		pngLen, _ = w.Write(png)
+	}))
+	t.Cleanup(dlSrv.Close)
+
+	fmsg := wecomaibot.FileMessage{}
+	fmsg.ReqID = "req_save_1"
+	fmsg.ChatID = "chat_1"
+	fmsg.File.URL = dlSrv.URL
+	saveDir := t.TempDir()
+	result := e.runInChatSave(t, "chat_1", fmsg, "read_attachment", `{"save":true}`, saveDir)
+	var parsed struct {
+		Ok    bool   `json:"ok"`
+		Type  string `json:"type"`
+		Saved string `json:"saved"`
+	}
+	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+		t.Fatalf("解析结果失败: %v（%s）", err, result)
+	}
+	if !parsed.Ok || parsed.Saved == "" {
+		t.Fatalf("save=true 应返回落盘路径: %s", result)
+	}
+	if strings.Contains(parsed.Saved, "..") {
+		t.Fatalf("saved 路径不应越出 saveDir: %s", parsed.Saved)
+	}
+	buf, err := os.ReadFile(parsed.Saved)
+	if err != nil || pngLen == 0 || len(buf) != pngLen {
+		t.Fatalf("落盘文件应可读且字节一致: err=%v len=%d", err, len(buf))
 	}
 }

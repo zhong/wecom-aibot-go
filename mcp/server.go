@@ -32,8 +32,10 @@ type WeComServer struct {
 
 // ToolSurface 是 acp 包集成所需的最小面（acp 单向依赖 mcp，不 import llm）。
 type ToolSurface interface {
-	// SetChat 在一条消息的 prompt 在途期间登记它的消息载体快照。
-	SetChat(chatKey string, req wecomaibot.RequestCarrier)
+	// SetChat 在一条消息的 prompt 在途期间登记它的消息载体快照；
+	// saveDir 是该会话 agent 的 cwd，附件落盘（read_attachment save=true）
+	// 写到那里让 agent 可读，可为空。
+	SetChat(chatKey string, req wecomaibot.RequestCarrier, saveDir string)
 	// ClearChat 在 prompt 收尾后清除快照。
 	ClearChat(chatKey string)
 	// URLFor 返回该会话专属的 MCP 端点（写 agent 项目配置用）。
@@ -118,8 +120,8 @@ func (s *WeComServer) Close() error {
 }
 
 // SetChat 实现 ToolSurface：登记在途消息快照。
-func (s *WeComServer) SetChat(chatKey string, req wecomaibot.RequestCarrier) {
-	s.reg.set(chatKey, req)
+func (s *WeComServer) SetChat(chatKey string, req wecomaibot.RequestCarrier, saveDir string) {
+	s.reg.set(chatKey, req, saveDir)
 }
 
 // ClearChat 实现 ToolSurface：清除快照。
@@ -257,7 +259,7 @@ func (s *WeComServer) handleToolsCall(ctx context.Context, chatKey string, param
 	if !ok {
 		return toolTextResult(`{"ok":false,"errcode":0,"errmsg":"该会话当前没有进行中的消息，无法执行企微工具"}`), nil
 	}
-	exec := llm.NewWeComExecutor(s.bot, entry.req)
+	exec := llm.NewWeComExecutorCwd(s.bot, entry.req, entry.saveDir)
 	out, err := exec(ctx, name, args)
 	if err != nil {
 		return nil, &rpcError{code: -32603, message: err.Error()}
