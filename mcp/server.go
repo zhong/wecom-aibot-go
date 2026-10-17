@@ -29,6 +29,10 @@ type WeComServer struct {
 	server *http.Server
 	ln     net.Listener
 
+	// sendLimiter 是外发类工具的每会话频控（nil = 关闭；
+	// SetSendMinInterval 配置，沙箱化部署建议启用）。
+	sendLimiter *sendLimiter
+
 	// advertiseBase 非空时 URL() 用它代替实际监听地址作基址
 	//（SetAdvertiseBase；容器化 agent 部署里的 host.docker.internal 通告）。
 	advertiseBase string
@@ -271,6 +275,14 @@ func (s *WeComServer) handleToolsCall(ctx context.Context, chatKey string, param
 	if !known {
 		return nil, &rpcError{code: -32602, message: "Unknown tool: " + name}
 	}
+	// 外发类工具频控：被限即在工具结果里如实告知（模型可自纠等待/放弃），
+	// 不当协议错。限速器 nil 或 interval 0 时零开销放行。
+	if sendTools[name] {
+		if ok, wait := s.sendLimiter.allow(chatKey); !ok {
+			return toolTextResult(`{"ok":false,"errcode":0,"errmsg":"发送过于频繁，` +
+				`请等待 ` + wait.Truncate(time.Millisecond).String() + ` 后再试"}`), nil
+		}
+	}
 	args := json.RawMessage("{}")
 	if p, ok := params["arguments"]; ok && len(p) > 0 {
 		args = p
@@ -285,7 +297,24 @@ func (s *WeComServer) handleToolsCall(ctx context.Context, chatKey string, param
 	if err != nil {
 		return nil, &rpcError{code: -32603, message: err.Error()}
 	}
+	// 外发类工具真正发出企微消息才消耗频控额度：结果未 ok（参数错/发送
+	// 失败/无法定位会话）时回滚本次占用，失败重试不会被自己挡住。
+	if sendTools[name] && !resultOK(out) {
+		s.sendLimiter.release(chatKey)
+	}
 	return toolTextResult(out), nil
+}
+
+// resultOK 判读 llm 工具结果 JSON（toolResultJSON 形状）的 ok 字段；
+// 解析失败按未成功处理（走 release 兜底）。
+func resultOK(out string) bool {
+	var res struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		return false
+	}
+	return res.OK
 }
 
 // toolTextResult 包一个文本 content 的 MCP 工具结果。

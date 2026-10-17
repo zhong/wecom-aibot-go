@@ -79,6 +79,10 @@ models.json 的 baseUrl 写 `http://host.docker.internal:3425/v1`。
 - 官方替代路径 `sudo container system dns create host.container.internal --localhost …`
   要 sudo + pf（禁用 iCloud Private Relay、重启丢失）——已避开，不需要。
 - 不设这些 env、`ACP_COMMAND=pi-acp` 直跑时，行为与无沙箱部署完全一致（沙箱纯叠加）。
+- **外发频控缺省启用**：`send_template_card`/`send_markdown` 每会话最小间隔
+  3s（`mcp.DefaultSendMinInterval`）——沙箱管不住的注入刷屏面由连接层兜底；
+  `ACP_SEND_MIN_INTERVAL_MS` 调整或置 0 关闭。被限调用返回 ok:false 等待
+  文案，模型自纠；发送失败不消耗额度。
 
 ## 完整 E2E 实测（2026-10-17，Apple container 路线）
 
@@ -92,6 +96,15 @@ pi-acp → 网关转发调宿主 LLM → 流式回复；pi 在容器内 `uname` 
    mcp.json 后选择了 bash+node 手写 HTTP 调端点——端点鉴权与执行完全正常，
    只是绕了一层。依赖原生 `mcp__wecom__*` 工具名时，需 pi-acp 上游支持
    http MCP（本仓库注记：MCP 端点与鉴权契约已就绪，升级即受益）。
+   上游跟踪（2026-10 调研）：svkozak/pi-acp 最新仍是 0.0.34（2026-09-24），
+   MCP 桥接无进展（#153 闭卷无评论，#159 路线图询问仍 open）。两个第三方
+   fork 实现了桥接但**均不适用本形态**：`@ccgv2/pi-acp`（0.7.0，活跃）拒
+   远程明文 HTTP（仅收 localhost/127.0.0.1/::1——容器网关 `192.168.64.1`
+   会被拒，安全设计面向 Zed 本机场景）；`@geohar/pi-acp`（0.3.2）经
+   pi-mcp-adapter + `--mcp-config` 临时文件桥接 http servers，但明确拒绝
+   写项目级 `.pi/mcp.json`（会踩 pi 自身高优先级配置命名空间）——而我们
+   的机制正是项目级 mcp.json + trust 预登记，且其需要额外装 pi-mcp-adapter。
+   结论：官方 pi-acp 升级前，bash+node 手调端点是本形态下最干净的路径。
 2. **read_attachment 的"当前消息没有附件"**：附件读取绑定的快照是"当前在途
    消息"，卡片消息成功后紧跟的文件消息若尚未进入 prompt 在途，工具会如实
    返回无附件自纠文案。复测"先发文件再一句话指令"即可正常统计；该行为

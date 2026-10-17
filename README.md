@@ -345,6 +345,9 @@ pi 注意事项：
 - pi 对 MCP 工具调用**默认不弹权限**（不走 `session/request_permission`，
   也不受 `AgentConfig.Permission` / `ACP_ALLOW_TOOL` 覆盖）——工具面本就
   只含企微发送/读取能力，无 fs/bash 面
+- 外发工具（`send_template_card` / `send_markdown`）带**每会话发送频控**
+  （最小间隔限速，examples 缺省启用 3s，`ACP_SEND_MIN_INTERVAL_MS` 可调/置 0
+  关闭）——注入滥用刷屏会被 ok:false 拒绝并提示等待，正常交互无感知
 - 为什么不经 ACP 的 `session/new.mcpServers` 传工具面：pi-acp（v0.0.34）
   收下该参数但不转发（上游已确认的已知限制），且 RPC 模式无对应方法；
   项目级 MCP 配置是 pi 官方支持的现实路径

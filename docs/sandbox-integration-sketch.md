@@ -168,7 +168,9 @@ P1 已实测），Blessed token 不变。
 2. **workDir 内任意写**：注入可让 agent 在工作区删除/改写会话文件。属可接受面
    （会话目录是 disposable），后续可加磁盘配额（`--storage-opt` 精细化）。
 3. **MCP 工具面**：`send_template_card/send_markdown` 仍可被注入滥用向群内发消息——
-   token 已按会话 pin 死端点，但发送频控仍缺，建议随本项一起排期（连接层加简单滑窗限速）。
+   token 已按会话 pin 死端点，发送频控已实现（`mcp.SetSendMinInterval`，每会话
+   最小间隔限速，examples/acp-bot 缺省启用，`ACP_SEND_MIN_INTERVAL_MS` 可调/关闭）；
+   被限调用返回 ok:false 等待文案，模型可自纠。
 4. **docker CLI 本身是提权面**：acp-bot 进程能跑 `docker run` 即能逃逸沙箱——这是运维
    面约束（宿主账号本身可信；不给远程用户触达 acp-bot 的面的路径），不在消息通道内。
 
@@ -191,7 +193,7 @@ USER pi
 1. **T1 `mcp` 通告基址**：`SetAdvertiseBase` + 单测；`examples/acp-bot` 接 `ACP_MCP_ADVERTISE_URL`。工作量最小，独立可测，先行。
 2. **T2 沙箱示例**：`scripts/sandbox/`（Dockerfile/build.sh/示例 env 文件）+ `examples/acp-bot` 文档注释补 `ACP_*_SANDBOX` 说明；不给 acp 包加任何沙箱代码——沙箱形态就是「换 argv」，这正是 AgentConfig 契约的设计回报。
 3. **T3 端到端实测**：本机 OrbStack 起完整链（企微 WS → acp-bot → 容器内 pi → 工具面卡片），验证 §1 三个要点 + §2 HOME/PI_CODING_AGENT_DIR 落位；`--read-only` 下 pi 正常工作。
-4. **T4（增强，可选）**：出口 proxy 域名白名单；MCP 发送频控。
+4. **T4**：~~MCP 发送频控~~（已实现，见上）；出口 proxy 域名白名单仍为增强项。
 
 以上每步不破坏既有部署：不设 `ACP_MCP_ADVERTISE_URL`、`ACP_COMMAND=pi-acp` 直接跑时
 行为与今日完全一致（沙箱是纯叠加，不改性）。
