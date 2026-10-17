@@ -2,12 +2,24 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+// decodedBlock 是 tool 请求断言用的 content 块解码结构。
+type decodedBlock struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Input     json.RawMessage `json:"input"`
+	ToolUseID string          `json:"tool_use_id"`
+}
 
 // errorsIs / errorsAntiCircular 是 errors.Is / errors.As 的直通别名，
 // 供测试文件统一引用（避免每个测试文件重复 import errors 却只用一次）。
@@ -189,4 +201,188 @@ func TestNewClientsValidation(t *testing.T) {
 	if _, err := NewAnthropicClient(AnthropicOptions{APIKey: "k"}); err == nil {
 		t.Error("Anthropic 缺 Model 应报错")
 	}
+}
+
+func TestAnthropicToolUseStream(t *testing.T) {
+	// tool_use 经 content_block_start/delta(input_json_delta)/stop 累积装配，
+	// stop_reason "tool_use" 流经 finishReason。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		body := strings.Join([]string{
+			`event: message_start` + "\n" + `data: {"type":"message_start"}`,
+			// 前置文本 + tool_use 块开始
+			`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"生成中…"}}`,
+			`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"send_template_card"}}`,
+			`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"card\":"}}`,
+			`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"card_type\":\"text_notice\"}}"}}`,
+			`event: content_block_stop` + "\n" + `data: {"type":"content_block_stop","index":1}`,
+			// 空参数 tool_use：归一为 {}
+			`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_2","name":"send_markdown"}}`,
+			`event: content_block_stop` + "\n" + `data: {"type":"content_block_stop","index":2}`,
+			`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}`,
+			`event: message_stop` + "\n" + `data: {"type":"message_stop"}`,
+		}, "\n\n") + "\n\n"
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewAnthropicClient(AnthropicOptions{APIKey: "k", BaseURL: srv.URL, Model: "claude-sonnet-5-5"})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+
+	var events []StreamEvent
+	finishReason, err := client.StreamChatEvents(context.Background(), ChatRequest{}, func(ev StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamChatEvents 失败: %v", err)
+	}
+	if finishReason != "tool_use" {
+		t.Errorf("finishReason = %q, 期望 tool_use", finishReason)
+	}
+
+	var texts, tools []ToolCall
+	for _, ev := range events {
+		switch ev.Type {
+		case StreamEventTextDelta:
+			texts = append(texts, ToolCall{ID: ev.TextDelta})
+		case StreamEventToolCall:
+			tools = append(tools, ev.ToolCall)
+		}
+	}
+	if len(texts) != 1 || texts[0].ID != "生成中…" {
+		t.Errorf("文本增量不对: %+v", texts)
+	}
+	if len(tools) != 2 {
+		t.Fatalf("应装配两个工具调用, 实际 %d", len(tools))
+	}
+	if tools[0].ID != "toolu_1" || tools[0].Name != "send_template_card" {
+		t.Errorf("第一个工具调用不对: %+v", tools[0])
+	}
+	if string(tools[0].Arguments) != `{"card":{"card_type":"text_notice"}}` {
+		t.Errorf("分片拼接参数不对: %s", tools[0].Arguments)
+	}
+	if string(tools[1].Arguments) != "{}" {
+		t.Errorf("空参数应归一 {}: %s", tools[1].Arguments)
+	}
+}
+
+func TestAnthropicRequestToolMapping(t *testing.T) {
+	// 请求方向：assistant ToolCalls → tool_use 块；连续 role "tool"
+	// 消息合批为一条 user 多 tool_result。用 json.RawMessage 保存原始
+	// 请求捕获后断言（避免二次解码丢 any）。
+	var rawReq []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawReq, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(anthropicSSE(t, []string{"ok"}, "")))
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewAnthropicClient(AnthropicOptions{APIKey: "k", BaseURL: srv.URL, Model: "claude"})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	req := ChatRequest{
+		SystemPrompt: "你是助手",
+		Messages: []ChatMessage{
+			{Role: "user", Content: "发卡片"},
+			{Role: "assistant", Content: "好的", ToolCalls: []ToolCall{{
+				ID: "toolu_1", Name: "send_template_card",
+				Arguments: json.RawMessage(`{"card":{"card_type":"text_notice"}}`),
+			}}},
+			{Role: "tool", ToolCallID: "toolu_1", Content: `{"ok":true}`},
+			{Role: "tool", ToolCallID: "toolu_2", Content: `{"ok":true}`},
+			{Role: "user", Content: "继续"},
+		},
+		Tools: []ToolDef{{
+			Name: "send_template_card", Description: "发卡片",
+			Parameters: map[string]any{"type": "object"},
+		}},
+	}
+	if _, err := client.StreamChat(context.Background(), req, func(string) error { return nil }); err != nil {
+		t.Fatalf("StreamChat 失败: %v", err)
+	}
+
+	var parsed struct {
+		System   string                `json:"system"`
+		Messages []decodedAnthropicMsg `json:"messages"`
+		Tools    []struct {
+			Name        string         `json:"name"`
+			InputSchema map[string]any `json:"input_schema"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(rawReq, &parsed); err != nil {
+		t.Fatalf("解析请求失败: %v", err)
+	}
+	if parsed.System != "你是助手" {
+		t.Errorf("system 应在顶层: %q", parsed.System)
+	}
+	if len(parsed.Messages) != 4 {
+		t.Fatalf("消息数不对（连续 tool 应合批）: %+v", parsed.Messages)
+	}
+	// assistant 块：text + tool_use
+	asst := parsed.Messages[1]
+	if asst.Role != "assistant" || len(asst.Content) != 2 {
+		t.Fatalf("assistant 应为 [text, tool_use]: %+v", asst)
+	}
+	if asst.Content[0].Type != "text" || asst.Content[0].Text != "好的" {
+		t.Errorf("text 块不对: %+v", asst.Content[0])
+	}
+	tu := asst.Content[1]
+	if tu.Type != "tool_use" || tu.ID != "toolu_1" || tu.Name != "send_template_card" {
+		t.Errorf("tool_use 块不对: %+v", tu)
+	}
+	if string(tu.Input) != `{"card":{"card_type":"text_notice"}}` {
+		t.Errorf("tool_use input 不对: %s", tu.Input)
+	}
+	// 两个连续 tool 结果合批进一条 user
+	merged := parsed.Messages[2]
+	if merged.Role != "user" || len(merged.Content) != 2 {
+		t.Fatalf("连续 tool 应合批为一条 user: %+v", merged)
+	}
+	for i, tr := range merged.Content {
+		if tr.Type != "tool_result" {
+			t.Errorf("块 %d 应为 tool_result: %+v", i, tr)
+		}
+	}
+	if merged.Content[0].ToolUseID != "toolu_1" || merged.Content[1].ToolUseID != "toolu_2" {
+		t.Errorf("tool_result 引用不对: %+v", merged.Content)
+	}
+	// 真正的用户消息不并入合批（content 为纯字符串线格式）
+	if parsed.Messages[3].Role != "user" || parsed.Messages[3].ContentPlain != "继续" {
+		t.Errorf("后续用户消息不应被合批吞掉: %+v", parsed.Messages[3])
+	}
+	if len(parsed.Tools) != 1 || parsed.Tools[0].Name != "send_template_card" {
+		t.Errorf("tools 目录不对: %+v", parsed.Tools)
+	}
+	if parsed.Tools[0].InputSchema["type"] != "object" {
+		t.Errorf("input_schema 应映射 Parameters: %+v", parsed.Tools[0].InputSchema)
+	}
+}
+
+// decodedAnthropicMsg 是请求断言用的宽松解码结构：Content 兼容纯字符串
+// （普通 user）与块数组（tool_use / tool_result）两种线格式。
+type decodedAnthropicMsg struct {
+	Role         string         `json:"role"`
+	Content      []decodedBlock `json:"content"`
+	ContentPlain string         `json:"-"`
+}
+
+func (m *decodedAnthropicMsg) UnmarshalJSON(b []byte) error {
+	// content 可能是纯字符串（普通 user），先按宽松结构解 role + 原始 content
+	var probe struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return err
+	}
+	m.Role = probe.Role
+	if len(probe.Content) > 0 && probe.Content[0] == '"' {
+		return json.Unmarshal(probe.Content, &m.ContentPlain)
+	}
+	return json.Unmarshal(probe.Content, &m.Content)
 }
