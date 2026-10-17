@@ -3,6 +3,9 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -73,6 +76,63 @@ func TestWeComExecutorMarkdownOverReplay(t *testing.T) {
 	}
 	if body.ChatID != "chat_1" || body.MsgType != "markdown" || !strings.Contains(body.Markdown.Content, "张三") {
 		t.Errorf("markdown 主动发送帧不对: %+v", body)
+	}
+}
+
+func TestWeComExecutorReadAttachment(t *testing.T) {
+	// 文本类附件（扩展名 .txt）：read_attachment 返回内容预览 JSON。
+	srv := newBotWSServer(t)
+	rec := make(chan string, 1)
+	connectBot(t, srv, func(bot *wecomaibot.Client, msg wecomaibot.TextMessage) {
+		exec := NewWeComExecutor(bot, msg)
+		r, err := exec(context.Background(), "read_attachment", json.RawMessage(`{}`))
+		if err != nil {
+			t.Errorf("执行失败: %v", err)
+		}
+		rec <- r
+	})
+	// 直接对携带附件的 FileMessage 载体执行（下载经 HTTP）。
+	file, _ := os.CreateTemp(t.TempDir(), "名单-*.txt")
+	_, _ = file.WriteString("张三,李四,王五")
+	_ = file.Close()
+	dlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := os.ReadFile(file.Name())
+		_, _ = w.Write(b)
+	}))
+	t.Cleanup(dlSrv.Close)
+
+	bot2, err := wecomaibot.NewClient(wecomaibot.Config{
+		BotID: "bot", Secret: "secret", WSURL: srv.url(),
+		HeartbeatIntervalMS: 60000, Logger: silentLogger{},
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	fmsg := wecomaibot.FileMessage{}
+	fmsg.ReqID = "req_1"
+	fmsg.File.URL = dlSrv.URL
+	fmsg.File.AESKey = ""
+	exec2 := NewWeComExecutor(bot2, fmsg)
+	r2, err := exec2(context.Background(), "read_attachment", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	var parsed struct {
+		Ok      bool   `json:"ok"`
+		Type    string `json:"type"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(r2), &parsed); err != nil {
+		t.Fatalf("解析结果失败: %v", err)
+	}
+	if !parsed.Ok || parsed.Type != "text" || !strings.Contains(parsed.Content, "张三") {
+		t.Errorf("文本附件应返回内容预览: %s", r2)
+	}
+
+	// 文本消息无附件：明确告知模型
+	r1 := <-rec
+	if !strings.Contains(r1, "没有附件") {
+		t.Errorf("无附件应明确返回: %s", r1)
 	}
 }
 

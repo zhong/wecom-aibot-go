@@ -3,8 +3,9 @@
 // 模型增量实时推成企微流式回复（打字机效果），并维护每个会话的有界对话历史。
 //
 // 开启 LLM_TOOLS（默认开启）时向模型注册企微交互工具（发模板卡片、发
-// markdown），由模型自行决定何时调用；工具执行的目标会话由执行器闭包绑定
-// 当前消息，模型无法伪造投递目标。
+// markdown、读取用户附件），由模型按内容形态自主决定何时调用——通知/数据/
+// 交互用卡片、格式化长文用 markdown、日常对话直接文本、附件先读再答；
+// 工具执行的目标会话由执行器闭包绑定当前消息，模型无法伪造投递目标。
 //
 // 环境变量：
 //
@@ -47,7 +48,12 @@ func main() {
 		log.Fatalf("初始化 LLM 客户端失败: %v", err)
 	}
 
+	// 系统提示词：未配置时用具默认选型指引——模型按内容形态自主选择
+	// 交互形式，不依赖用户显式指令。
 	systemPrompt := os.Getenv("LLM_SYSTEM_PROMPT")
+	if systemPrompt == "" {
+		systemPrompt = defaultSystemPrompt
+	}
 	tools := toolsEnabled()
 	history := newChatHistory(historyLimit())
 
@@ -166,6 +172,15 @@ func (h *chatHistory) snapshot(chatKey string) []llm.ChatMessage {
 	return append([]llm.ChatMessage(nil), h.store[chatKey]...)
 }
 
+// defaultSystemPrompt 是未配置 LLM_SYSTEM_PROMPT 时的默认系统提示词：
+// 引导模型按内容形态自主选择企微交互形式，而非只响应用户的明确指令。
+const defaultSystemPrompt = `你是企业微信里的智能机器人助手。根据内容形态自主选择最合适的回复方式：
+- 通知、公告、数据展示、需要用户选择或操作的内容 → 调用 send_template_card 发模板卡片；
+- 大段格式化长文本（表格、多层列表、多级标题、代码块）→ 调用 send_markdown 补充发送；
+- 日常对话、简短问答 → 直接写在普通回复文本里，不用任何工具；
+- 用户消息携带附件（文件/图片/视频/图文混排）→ 先调用 read_attachment 读取内容再作答。
+没有明确要求时也应主动选择更合适的呈现形式。发完卡片或 markdown 后，普通回复里给一句简短说明即可，不要重复其内容。`
+
 func registerLLMHandlers(bot *wecomaibot.Client, client llm.Client, systemPrompt string, tools bool, history *chatHistory) {
 	// 工具目录在开启时下发给模型；卡片/markdown 的目标会话由执行器闭包
 	// 绑定到当前消息回调，模型只能决定内容。
@@ -186,8 +201,10 @@ func registerLLMHandlers(bot *wecomaibot.Client, client llm.Client, systemPrompt
 			Tools:        toolDefs,
 		}
 		streamID := wecomaibot.GenerateReqID("stream")
+		// FinalRoundOnly 开启终帧净化：终帧只携带最后一轮正文，
+		// 工具轮的中间独白不进终稿与历史。
 		final, err := llm.AgentReply(context.Background(), bot, req, streamID, client, chatReq,
-			llm.NewWeComExecutor(bot, req), "正在思考...", llm.TurnOptions{})
+			llm.NewWeComExecutor(bot, req), "正在思考...", llm.TurnOptions{FinalRoundOnly: true})
 		if err != nil {
 			log.Printf("[%s] LLM Agent 回复失败(耗时=%v): %v", kind, time.Since(start), err)
 		}
@@ -206,6 +223,29 @@ func registerLLMHandlers(bot *wecomaibot.Client, client llm.Client, systemPrompt
 	bot.OnVoice(func(_ context.Context, msg wecomaibot.VoiceMessage) {
 		safeGo("LLM 语音处理", func() {
 			handle("voice", chatKeyOf(msg.ChatID, msg.From.UserID), msg.Voice.Content, msg)
+		})
+	})
+
+	// 附件类消息：文本描述进上下文，模型可用 read_attachment 工具
+	// 自主读取附件内容（文本类附件会回喂内容预览）再作答。
+	bot.OnFile(func(_ context.Context, msg wecomaibot.FileMessage) {
+		safeGo("LLM 文件处理", func() {
+			handle("file", chatKeyOf(msg.ChatID, msg.From.UserID), "[用户发来文件]", msg)
+		})
+	})
+	bot.OnImage(func(_ context.Context, msg wecomaibot.ImageMessage) {
+		safeGo("LLM 图片处理", func() {
+			handle("image", chatKeyOf(msg.ChatID, msg.From.UserID), "[用户发来图片]", msg)
+		})
+	})
+	bot.OnVideo(func(_ context.Context, msg wecomaibot.VideoMessage) {
+		safeGo("LLM 视频处理", func() {
+			handle("video", chatKeyOf(msg.ChatID, msg.From.UserID), "[用户发来视频]", msg)
+		})
+	})
+	bot.OnMixed(func(_ context.Context, msg wecomaibot.MixedMessage) {
+		safeGo("LLM 混排消息处理", func() {
+			handle("mixed", chatKeyOf(msg.ChatID, msg.From.UserID), "[用户发来图文混排消息]", msg)
 		})
 	})
 
