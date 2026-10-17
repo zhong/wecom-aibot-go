@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -296,7 +295,6 @@ func TestEnableToolsValidation(t *testing.T) {
 
 // mcpServerStub 是 Handle 快照钩子的最小面验证桩：记录 Set/Clear 调用。
 type mcpServerStub struct {
-	mu    sync.Mutex
 	calls []string
 }
 

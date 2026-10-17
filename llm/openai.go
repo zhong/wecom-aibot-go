@@ -39,10 +39,10 @@ type OpenAIOptions struct {
 // NewOpenAIClient 创建 OpenAI 兼容客户端，校验必填项。
 func NewOpenAIClient(opts OpenAIOptions) (*OpenAIClient, error) {
 	if opts.APIKey == "" {
-		return nil, fmt.Errorf("OpenAI 客户端缺少 APIKey")
+		return nil, fmt.Errorf("创建 OpenAI 客户端需要先提供 apiKey")
 	}
 	if opts.Model == "" {
-		return nil, fmt.Errorf("OpenAI 客户端缺少 Model")
+		return nil, fmt.Errorf("创建 OpenAI 客户端需要先提供 model")
 	}
 	if opts.BaseURL == "" {
 		opts.BaseURL = DefaultOpenAIBaseURL

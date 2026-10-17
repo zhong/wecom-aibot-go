@@ -117,7 +117,7 @@ func TestHandleFrameUnknownPassthrough(t *testing.T) {
 	w.handleFrame(context.Background(), WsFrameRaw{Headers: WsHeaders{ReqID: "unknown_1"}})
 	w.handleFrame(context.Background(), WsFrameRaw{}) // reqID == ""
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		select {
 		case <-got:
 		case <-time.After(time.Second):

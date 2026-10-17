@@ -68,10 +68,10 @@ func NewClient(cfg Config) (*Client, error) {
 
 func fillDefaultConfig(cfg Config) (Config, error) {
 	if cfg.BotID == "" {
-		return Config{}, errors.New("BotID 不能为空")
+		return Config{}, errors.New("botID 不能为空")
 	}
 	if cfg.Secret == "" {
-		return Config{}, errors.New("Secret 不能为空")
+		return Config{}, errors.New("secret 不能为空")
 	}
 	if cfg.ReconnectIntervalMS <= 0 {
 		cfg.ReconnectIntervalMS = DefaultReconnectInterval

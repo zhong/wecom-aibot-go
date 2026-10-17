@@ -26,7 +26,7 @@ func trimSSEData(line string) string {
 	return strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 }
 
-// DefaultTimeout 是 LLM 流式请求的整体默认超时（毫秒），
+// DefaultTimeoutMS 是 LLM 流式请求的整体默认超时（毫秒），
 // 命名与根包 Config 的 XxxMS / DefaultXxx 约定保持一致。
 const DefaultTimeoutMS = 120000
 

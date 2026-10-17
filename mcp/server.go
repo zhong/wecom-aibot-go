@@ -250,7 +250,7 @@ func (s *WeComServer) handleToolsCall(ctx context.Context, chatKey string, param
 	if !known {
 		return nil, &rpcError{code: -32602, message: "Unknown tool: " + name}
 	}
-	var args json.RawMessage = json.RawMessage("{}")
+	args := json.RawMessage("{}")
 	if p, ok := params["arguments"]; ok && len(p) > 0 {
 		args = p
 	}

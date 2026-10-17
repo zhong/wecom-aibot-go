@@ -199,7 +199,7 @@ func TestConcurrentRepliesToSameMessage(t *testing.T) {
 	const n = 10
 	var wg sync.WaitGroup
 	errs := make(chan error, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -226,14 +226,12 @@ func TestReplyQueueRefcountCleanup(t *testing.T) {
 	const goroutines = 50
 	const distinct = 10 // 故意碰撞，让部分 req_id 出现 refs>1 的并发持有
 	var wg sync.WaitGroup
-	for i := 0; i < goroutines; i++ {
+	for i := range goroutines {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			reqID := "req_" + string(rune('a'+i%distinct))
 			q := w.acquireReplyQueue(reqID)
-			q.mu.Lock()
-			q.mu.Unlock()
 			w.releaseReplyQueue(q)
 		}(i)
 	}

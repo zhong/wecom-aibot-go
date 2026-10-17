@@ -139,47 +139,40 @@ func (d *dispatcher) addDisconnectedEventHandler(handler func(context.Context, E
 	d.onDisconnectedEvent = append(d.onDisconnectedEvent, handler)
 }
 
-func (d *dispatcher) emitConnected(ctx context.Context) {
+// snapshotHandlers 在读锁内复制一份回调切片：发射循环不再持锁，
+// 新注册的 handler 对已开始的发射不可见（与既有行为一致）。
+func snapshotHandlers[T any](d *dispatcher, handlers *[]T) []T {
 	d.mu.RLock()
-	handlers := append([]func(context.Context){}, d.onConnected...)
-	d.mu.RUnlock()
-	for _, handler := range handlers {
+	defer d.mu.RUnlock()
+	return append([]T{}, *handlers...)
+}
+
+func (d *dispatcher) emitConnected(ctx context.Context) {
+	for _, handler := range snapshotHandlers(d, &d.onConnected) {
 		go handler(ctx)
 	}
 }
 
 func (d *dispatcher) emitAuthenticated(ctx context.Context) {
-	d.mu.RLock()
-	handlers := append([]func(context.Context){}, d.onAuthenticated...)
-	d.mu.RUnlock()
-	for _, handler := range handlers {
+	for _, handler := range snapshotHandlers(d, &d.onAuthenticated) {
 		go handler(ctx)
 	}
 }
 
 func (d *dispatcher) emitDisconnected(ctx context.Context, reason string) {
-	d.mu.RLock()
-	handlers := append([]func(context.Context, string){}, d.onDisconnected...)
-	d.mu.RUnlock()
-	for _, handler := range handlers {
+	for _, handler := range snapshotHandlers(d, &d.onDisconnected) {
 		go handler(ctx, reason)
 	}
 }
 
 func (d *dispatcher) emitReconnecting(ctx context.Context, attempt int) {
-	d.mu.RLock()
-	handlers := append([]func(context.Context, int){}, d.onReconnecting...)
-	d.mu.RUnlock()
-	for _, handler := range handlers {
+	for _, handler := range snapshotHandlers(d, &d.onReconnecting) {
 		go handler(ctx, attempt)
 	}
 }
 
 func (d *dispatcher) emitError(ctx context.Context, err error) {
-	d.mu.RLock()
-	handlers := append([]func(context.Context, error){}, d.onError...)
-	d.mu.RUnlock()
-	for _, handler := range handlers {
+	for _, handler := range snapshotHandlers(d, &d.onError) {
 		go handler(ctx, err)
 	}
 }
