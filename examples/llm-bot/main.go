@@ -2,6 +2,10 @@
 // 文本/语音消息转发给 LLM（OpenAI 兼容或 Anthropic Claude），
 // 模型增量实时推成企微流式回复（打字机效果），并维护每个会话的有界对话历史。
 //
+// 开启 LLM_TOOLS（默认开启）时向模型注册企微交互工具（发模板卡片、发
+// markdown），由模型自行决定何时调用；工具执行的目标会话由执行器闭包绑定
+// 当前消息，模型无法伪造投递目标。
+//
 // 环境变量：
 //
 //	WECOM_BOT_ID       机器人 ID（必填）
@@ -13,6 +17,7 @@
 //	LLM_SYSTEM_PROMPT  系统提示词（可选）
 //	LLM_HISTORY_LIMIT  每会话保留的最大消息条数（可选，默认 20）
 //	LLM_INCLUDE_REASONING  置 1 时透传推理模型的思维链增量（可选，默认只发正文）
+//	LLM_TOOLS          置 0 关闭工具调用（可选，默认开启）
 package main
 
 import (
@@ -43,6 +48,7 @@ func main() {
 	}
 
 	systemPrompt := os.Getenv("LLM_SYSTEM_PROMPT")
+	tools := toolsEnabled()
 	history := newChatHistory(historyLimit())
 
 	bot, err := wecomaibot.NewClient(wecomaibot.Config{
@@ -58,7 +64,7 @@ func main() {
 	}
 
 	registerLifecycleLogs(bot)
-	registerLLMHandlers(bot, client, systemPrompt, history)
+	registerLLMHandlers(bot, client, systemPrompt, tools, history)
 	startHealthServer(bot)
 
 	if err := bot.Connect(); err != nil {
@@ -160,8 +166,15 @@ func (h *chatHistory) snapshot(chatKey string) []llm.ChatMessage {
 	return append([]llm.ChatMessage(nil), h.store[chatKey]...)
 }
 
-func registerLLMHandlers(bot *wecomaibot.Client, client llm.Client, systemPrompt string, history *chatHistory) {
-	// 文本与语音（语音已被企微转写为文本）共用同一条 LLM 流式回复链路
+func registerLLMHandlers(bot *wecomaibot.Client, client llm.Client, systemPrompt string, tools bool, history *chatHistory) {
+	// 工具目录在开启时下发给模型；卡片/markdown 的目标会话由执行器闭包
+	// 绑定到当前消息回调，模型只能决定内容。
+	var toolDefs []llm.ToolDef
+	if tools {
+		toolDefs = llm.WeComToolDefs()
+	}
+
+	// 文本与语音（语音已被企微转写为文本）共用同一条 LLM Agent 回复链路
 	handle := func(kind, chatKey, text string, req wecomaibot.RequestCarrier) {
 		start := time.Now()
 		log.Printf("[%s] 收到消息(chat=%s): %q", kind, chatKey, text)
@@ -170,13 +183,16 @@ func registerLLMHandlers(bot *wecomaibot.Client, client llm.Client, systemPrompt
 		chatReq := llm.ChatRequest{
 			Messages:     append(history.snapshot(chatKey), llm.ChatMessage{Role: "user", Content: text}),
 			SystemPrompt: systemPrompt,
+			Tools:        toolDefs,
 		}
 		streamID := wecomaibot.GenerateReqID("stream")
-		final, err := llm.StreamReply(context.Background(), bot, req, streamID, client, chatReq, "正在思考...")
+		final, err := llm.AgentReply(context.Background(), bot, req, streamID, client, chatReq,
+			llm.NewWeComExecutor(bot, req), "正在思考...", llm.TurnOptions{})
 		if err != nil {
-			log.Printf("[%s] LLM 流式回复失败(耗时=%v): %v", kind, time.Since(start), err)
+			log.Printf("[%s] LLM Agent 回复失败(耗时=%v): %v", kind, time.Since(start), err)
 		}
-		// 用终帧实际发出的文本补记这一轮，保持历史与用户所见一致
+		// 用终帧实际发出的文本补记这一轮：工具轮（卡片/markdown 操作）在
+		// RunTurn 内即逝、不进历史；流水正文与用户所见保持一致。
 		history.append(chatKey, text, final)
 		log.Printf("[%s] 回复完成(耗时=%v, %d字): %q", kind, time.Since(start), len([]rune(final)), final)
 	}
@@ -204,6 +220,34 @@ func registerLLMHandlers(bot *wecomaibot.Client, client llm.Client, systemPrompt
 			}
 		})
 	})
+
+	// 卡片交互事件：更新已有卡片必须在事件后 5 秒窗口内完成，一次 LLM 往返
+	// 不可达——所以卡片更新走确定性路径，不经过 LLM。这里给出最小示例：
+	// 按钮/投票点击后把选中结果回显到卡片。
+	bot.OnTemplateCardEvent(func(_ context.Context, msg wecomaibot.EventMessage) {
+		safeGo("卡片事件", func() {
+			ev := msg.Event.TemplateCardEvent
+			if ev == nil {
+				return
+			}
+			log.Printf("[卡片事件] card_type=%s event_key=%q task_id=%q", ev.CardType, ev.EventKey, ev.TaskID)
+			// 业务在此按 event_key 分发：如把投票计数落库、用 UpdateTemplateCard
+			// 在窗口内回写更新后的卡片（空 userIDs 表示更新所有可见用户）。
+			updated := wecomaibot.TemplateCard{
+				"card_type":  wecomaibot.TemplateCardTypeMultipleInteraction,
+				"task_id":    ev.TaskID,
+				"main_title": map[string]any{"title": "已收到你的选择", "desc": ev.EventKey},
+			}
+			if _, err := bot.UpdateTemplateCard(msg, updated, nil); err != nil {
+				log.Printf("更新卡片失败: %v", err)
+			}
+		})
+	})
+}
+
+// toolsEnabled 读 LLM_TOOLS：默认开启，置 0 关闭工具调用。
+func toolsEnabled() bool {
+	return os.Getenv("LLM_TOOLS") != "0"
 }
 
 // chatKeyOf 生成会话 key：群聊用 ChatID；单聊没有 ChatID 时回退到 UserID。

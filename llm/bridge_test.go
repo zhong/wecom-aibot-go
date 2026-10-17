@@ -126,28 +126,106 @@ func (s *botWSServer) sendMsgFrames() []wecomaibot.WsFrameRaw {
 	return out
 }
 
+// templateCardFrames 返回卡片帧（aibot_respond_msg 里 msgtype 为
+// template_card 的回复），并解出 card 内容，供工具执行断言。
+func (s *botWSServer) templateCardFrames() []map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []map[string]any
+	for _, f := range s.frames {
+		if f.Cmd != "aibot_respond_msg" {
+			continue
+		}
+		var body struct {
+			MsgType      string         `json:"msgtype"`
+			TemplateCard map[string]any `json:"template_card"`
+		}
+		if err := json.Unmarshal(f.Body, &body); err != nil || body.MsgType != "template_card" {
+			continue
+		}
+		out = append(out, body.TemplateCard)
+	}
+	return out
+}
+
 func (s *botWSServer) url() string {
 	return "ws" + strings.TrimPrefix(s.srv.URL, "http")
 }
 
-// fakeLLM 实现 Client 接口，按脚本输出增量；可注入中途错误。
-type fakeLLM struct {
-	deltas       []string
-	streamErr    error
-	onDeltaCalls int
+// fakeRound 是 fakeLLM 的一轮脚本：文本增量 + 本轮末尾产出的工具调用。
+type fakeRound struct {
+	deltas    []string
+	toolCalls []ToolCall
+	roundErr  error
 }
 
-func (f *fakeLLM) StreamChat(_ context.Context, _ ChatRequest, onDelta func(string) error) (string, error) {
-	for _, d := range f.deltas {
+// fakeLLM 实现 Client 接口：按 rounds 脚本轮次输出（每调用一次弹出最旧一轮），
+// 兼容旧的单轮用法（deltas/streamErr 被视为唯一一轮）。记录收到的全部请求。
+type fakeLLM struct {
+	rounds       []fakeRound
+	streamErr    error // rounds 为空时兜底注入的中途错误
+	onDeltaCalls int
+	mu           sync.Mutex
+	gotReqs      []ChatRequest
+}
+
+// newSingleRoundLLM 构造旧式单轮 fake（既有 StreamReply 测试用）。
+func newSingleRoundLLM(deltas []string, streamErr error) *fakeLLM {
+	return &fakeLLM{rounds: []fakeRound{{deltas: deltas, roundErr: streamErr}}}
+}
+
+func (f *fakeLLM) StreamChat(ctx context.Context, req ChatRequest, onDelta func(string) error) (string, error) {
+	return f.StreamChatEvents(ctx, req, eventsToDelta(onDelta))
+}
+
+func (f *fakeLLM) StreamChatEvents(_ context.Context, req ChatRequest, onEvent func(StreamEvent) error) (string, error) {
+	f.mu.Lock()
+	f.gotReqs = append(f.gotReqs, req)
+	if len(f.rounds) == 0 {
+		f.mu.Unlock()
+		if f.streamErr != nil {
+			return "", f.streamErr
+		}
+		return "stop", nil
+	}
+	round := f.rounds[0]
+	f.rounds = f.rounds[1:]
+	f.mu.Unlock()
+
+	for _, d := range round.deltas {
+		f.mu.Lock()
 		f.onDeltaCalls++
-		if err := onDelta(d); err != nil {
+		f.mu.Unlock()
+		if err := onEvent(StreamEvent{Type: StreamEventTextDelta, TextDelta: d}); err != nil {
 			return "", err
 		}
 	}
-	if f.streamErr != nil {
-		return "", f.streamErr
+	for _, tc := range round.toolCalls {
+		if err := onEvent(StreamEvent{Type: StreamEventToolCall, ToolCall: tc}); err != nil {
+			return "", err
+		}
+	}
+	if round.roundErr != nil {
+		return "", round.roundErr
+	}
+	if len(round.toolCalls) > 0 {
+		return "tool_calls", nil
 	}
 	return "stop", nil
+}
+
+// popReq 返回第 i 次收到的请求（供多轮断言）。
+func (f *fakeLLM) popReq(i int) ChatRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gotReqs[i]
+}
+
+// reqCount 返回收到的请求总数。
+func (f *fakeLLM) reqCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.gotReqs)
 }
 
 // connectBot 启动假服务端 + 客户端连接，收到推送的文本消息后把 bot 与消息
@@ -185,7 +263,7 @@ func TestStreamReplyHappyPath(t *testing.T) {
 	srv := newBotWSServer(t)
 	done := make(chan string, 1)
 	connectBot(t, srv, func(bot *wecomaibot.Client, msg wecomaibot.TextMessage) {
-		client := &fakeLLM{deltas: []string{"你好", "，", "世界"}}
+		client := newSingleRoundLLM([]string{"你好", "，", "世界"}, nil)
 		streamID := wecomaibot.GenerateReqID("stream")
 		final, err := StreamReply(context.Background(), bot, msg, streamID, client,
 			ChatRequest{}, "正在思考...")
@@ -234,7 +312,7 @@ func TestStreamReplyLLMErrorSendsErrorFinish(t *testing.T) {
 	done := make(chan struct{})
 	connectBot(t, srv, func(bot *wecomaibot.Client, msg wecomaibot.TextMessage) {
 		defer close(done)
-		client := &fakeLLM{deltas: nil, streamErr: errAbort}
+		client := newSingleRoundLLM(nil, errAbort)
 		streamID := wecomaibot.GenerateReqID("stream")
 		_, err := StreamReply(context.Background(), bot, msg, streamID, client,
 			ChatRequest{}, "")
@@ -261,7 +339,7 @@ func TestStreamReplyEmptyResponse(t *testing.T) {
 	done := make(chan struct{})
 	connectBot(t, srv, func(bot *wecomaibot.Client, msg wecomaibot.TextMessage) {
 		defer close(done)
-		client := &fakeLLM{deltas: nil}
+		client := newSingleRoundLLM(nil, nil)
 		streamID := wecomaibot.GenerateReqID("stream")
 		_, err := StreamReply(context.Background(), bot, msg, streamID, client,
 			ChatRequest{}, "思考中")
@@ -288,7 +366,7 @@ func TestStreamReplyLLMErrorKeepsPartialContent(t *testing.T) {
 	done := make(chan struct{})
 	connectBot(t, srv, func(bot *wecomaibot.Client, msg wecomaibot.TextMessage) {
 		defer close(done)
-		client := &fakeLLM{deltas: []string{"前半"}, streamErr: errAbort}
+		client := newSingleRoundLLM([]string{"前半"}, errAbort)
 		streamID := wecomaibot.GenerateReqID("stream")
 		_, err := StreamReply(context.Background(), bot, msg, streamID, client,
 			ChatRequest{}, "")
@@ -329,3 +407,82 @@ func TestExtractChatID(t *testing.T) {
 type unknownCarrier struct{}
 
 func (unknownCarrier) RequestID() string { return "r" }
+
+func TestAgentReplyCardAndFinalFrame(t *testing.T) {
+	// 两轮脚本：第一轮流前置文本 + 发卡片工具，第二轮终稿文本。
+	srv := newBotWSServer(t)
+	card := map[string]any{
+		"card_type":  "text_notice",
+		"main_title": map[string]any{"title": "本周值班表", "desc": "值班安排"},
+	}
+	cardRaw, _ := json.Marshal(card)
+	client := &fakeLLM{rounds: []fakeRound{
+		{
+			deltas:    []string{"正在生成值班卡片…"},
+			toolCalls: []ToolCall{{ID: "call_1", Name: "send_template_card", Arguments: json.RawMessage(`{"card":` + string(cardRaw) + `}`)}},
+		},
+		{deltas: []string{"已发出，请查收。"}},
+	}}
+	done := make(chan string, 1)
+	connectBot(t, srv, func(bot *wecomaibot.Client, msg wecomaibot.TextMessage) {
+		streamID := wecomaibot.GenerateReqID("stream")
+		final, err := AgentReply(context.Background(), bot, msg, streamID, client,
+			ChatRequest{}, NewWeComExecutor(bot, msg), "正在思考...",
+			TurnOptions{RoundNotice: "\n"})
+		if err != nil {
+			t.Errorf("AgentReply 失败: %v", err)
+		}
+		done <- final
+	})
+	final := <-done
+	time.Sleep(200 * time.Millisecond)
+
+	// 工具执行应原路发出一张卡片帧
+	cards := srv.templateCardFrames()
+	if len(cards) != 1 {
+		t.Fatalf("应发出一张卡片, 实际 %d", len(cards))
+	}
+	if cards[0]["card_type"] != "text_notice" {
+		t.Errorf("卡片 card_type 不对: %+v", cards[0]["card_type"])
+	}
+	// 终帧 = 占位替换后的累积全文（前置文本 + 轮间提示 + 终稿），且闭环
+	frames := srv.streamFrames()
+	if len(frames) < 2 {
+		t.Fatalf("流式帧过少: %d", len(frames))
+	}
+	last := frames[len(frames)-1]
+	want := "正在生成值班卡片…\n已发出，请查收。"
+	if !last.Finish || last.Content != want {
+		t.Errorf("终帧应为 finish=true 且携带全文 %q: %+v", want, last)
+	}
+	if final != want {
+		t.Errorf("finalText = %q, 期望 %q", final, want)
+	}
+}
+
+func TestAgentReplyErrorClosesStream(t *testing.T) {
+	// 第一轮流中途出错：已有内容则带内容发终帧，流闭环且错误上抛。
+	srv := newBotWSServer(t)
+	client := &fakeLLM{rounds: []fakeRound{{deltas: []string{"前半"}, roundErr: errAbort}}}
+	done := make(chan struct{})
+	connectBot(t, srv, func(bot *wecomaibot.Client, msg wecomaibot.TextMessage) {
+		defer close(done)
+		streamID := wecomaibot.GenerateReqID("stream")
+		_, err := AgentReply(context.Background(), bot, msg, streamID, client,
+			ChatRequest{}, NewWeComExecutor(bot, msg), "", TurnOptions{})
+		if !errorsIs(err, errAbort) {
+			t.Errorf("LLM 错误应向上传播, 实际: %v", err)
+		}
+	})
+	<-done
+	time.Sleep(200 * time.Millisecond)
+
+	frames := srv.streamFrames()
+	if len(frames) == 0 {
+		t.Fatal("没有流式帧, 未闭环")
+	}
+	last := frames[len(frames)-1]
+	if !last.Finish || last.Content != "前半" {
+		t.Errorf("终帧应带半截内容: %+v", last)
+	}
+}

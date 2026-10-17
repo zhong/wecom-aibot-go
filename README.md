@@ -222,6 +222,34 @@ go run ./examples/llm-bot
 > 设计说明：库保持无状态——多轮对话历史由示例层维护（per-chat 有界 slice），
 > 这样接入方可以自由替换为 Redis / 数据库等持久化实现。
 
+### 工具调用：让模型自主使用企微丰富交互
+
+`llm` 包支持工业界标准的工具调用（Tool Calling）：把企微交互能力注册成工具，
+连同 JSON Schema 发给模型，由模型自行决定何时发模板卡片、何时发 markdown
+补充消息；SDK 侧执行工具后把结果回喂模型，循环直到模型给出最终回复。
+
+- `ChatRequest.Tools` / `llm.ToolDef` / `llm.StreamChatEvents`（`StreamChat`
+  保持兼容，只回调文本增量）
+- `llm.RunTurn(...)` — 多轮「模型 → 工具 → 模型」循环（默认最多 5 轮，
+  工具执行失败会作为结果回喂模型自行调整）
+- `llm.AgentReply(...)` — 带工具循环的流式桥，帧闭环与 `StreamReply` 一致
+- `llm.WeComToolDefs()` / `llm.NewWeComExecutor(bot, msg)` — 内置工具目录
+  （`send_template_card` / `send_markdown`）与执行器；目标会话由执行器闭包
+  绑定当前消息，模型无法伪造投递目标
+
+```go
+chatReq := llm.ChatRequest{
+    Messages: hist, SystemPrompt: prompt,
+    Tools: llm.WeComToolDefs(),
+}
+final, err := llm.AgentReply(ctx, bot, msg, wecomaibot.GenerateReqID("stream"),
+    client, chatReq, llm.NewWeComExecutor(bot, msg), "正在思考...", llm.TurnOptions{})
+```
+
+> 注意：`update_template_card` 有意不在工具目录内——卡片事件后只有 5 秒
+> 更新窗口，一次 LLM 往返不可达；卡片更新应在 `OnTemplateCardEvent`
+> 处理器里确定性完成（见 `examples/llm-bot`）。
+
 ## 文件下载与解密
 
 ```go
@@ -269,7 +297,7 @@ wecom-aibot-go/
   logger.go         日志接口与默认实现
   types.go          协议类型、常量与配置
   utils.go          req_id 生成
-  llm/              大模型对接子包（OpenAI 兼容 + Anthropic + 流式桥）
+  llm/              大模型对接子包（OpenAI 兼容 + Anthropic + 流式桥 + 工具调用）
   examples/main.go
   examples/production/main.go
   examples/llm-bot/main.go
