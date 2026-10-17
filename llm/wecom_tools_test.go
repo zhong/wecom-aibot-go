@@ -335,3 +335,51 @@ func TestReadAttachmentSaveToDir(t *testing.T) {
 		t.Errorf("文本类附件应照常内容预览: %s", r4)
 	}
 }
+
+// TestSaveInflightAttachment 连接层主动落盘路径：带附件的 FileMessage 载体
+// 下载并落盘到给定目录，返回可读绝对路径；无附件载体返回空无错误。
+func TestSaveInflightAttachment(t *testing.T) {
+	srv := newBotWSServer(t)
+	bot, err := wecomaibot.NewClient(wecomaibot.Config{
+		BotID: "bot", Secret: "secret", WSURL: srv.url(),
+		HeartbeatIntervalMS: 60000, Logger: silentLogger{},
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+
+	file, _ := os.CreateTemp(t.TempDir(), "名单-*.txt")
+	_, _ = file.WriteString("张三,李四,王五")
+	_ = file.Close()
+	dlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := os.ReadFile(file.Name())
+		_, _ = w.Write(b)
+	}))
+	t.Cleanup(dlSrv.Close)
+
+	dir := t.TempDir()
+	fmsg := wecomaibot.FileMessage{}
+	fmsg.ReqID = "req_1"
+	fmsg.File.URL = dlSrv.URL
+	path, err := SaveInflightAttachment(context.Background(), bot, fmsg, dir)
+	if err != nil || path == "" {
+		t.Fatalf("落盘应成功: path=%q err=%v", path, err)
+	}
+	buf, err := os.ReadFile(path)
+	if err != nil || string(buf) != "张三,李四,王五" {
+		t.Fatalf("落盘内容应可读且一致: err=%v content=%q", err, buf)
+	}
+
+	// 无附件载体（纯文本）：空结果无错误。
+	tmsg := wecomaibot.TextMessage{}
+	if p, err := SaveInflightAttachment(context.Background(), bot, tmsg, dir); p != "" || err != nil {
+		t.Fatalf("无附件应返回空: path=%q err=%v", p, err)
+	}
+	// 下载失败：返回错误（调用方退回工具引导）。
+	fmsg2 := wecomaibot.FileMessage{}
+	fmsg2.ReqID = "req_2"
+	fmsg2.File.URL = "http://127.0.0.1:1/nope"
+	if p, err := SaveInflightAttachment(context.Background(), bot, fmsg2, dir); p != "" || err == nil {
+		t.Fatalf("下载失败应返回错误: path=%q err=%v", p, err)
+	}
+}
