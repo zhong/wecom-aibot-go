@@ -79,3 +79,20 @@ models.json 的 baseUrl 写 `http://host.docker.internal:3425/v1`。
 - 官方替代路径 `sudo container system dns create host.container.internal --localhost …`
   要 sudo + pf（禁用 iCloud Private Relay、重启丢失）——已避开，不需要。
 - 不设这些 env、`ACP_COMMAND=pi-acp` 直跑时，行为与无沙箱部署完全一致（沙箱纯叠加）。
+
+## 完整 E2E 实测（2026-10-17，Apple container 路线）
+
+生产形态全链路跑通：企微消息 → acp-bot（WS）→ `container run -i` microVM 内
+pi-acp → 网关转发调宿主 LLM → 流式回复；pi 在容器内 `uname` 自报 Linux、
+宿主仅 workDir 可见，经 `.pi/mcp.json` + Bearer 成功调用工具面 `send_template_card`
+（`ok:true`，卡片落群）。两个行为备忘：
+
+1. **pi 未径直走原生 MCP 工具**：pi-acp 0.0.34 的 `mcpCapabilities.http=false`
+   （容器内 pi 不自动加载项目 mcp.json 的 MCP 客户端），实测里 pi 读到
+   mcp.json 后选择了 bash+node 手写 HTTP 调端点——端点鉴权与执行完全正常，
+   只是绕了一层。依赖原生 `mcp__wecom__*` 工具名时，需 pi-acp 上游支持
+   http MCP（本仓库注记：MCP 端点与鉴权契约已就绪，升级即受益）。
+2. **read_attachment 的"当前消息没有附件"**：附件读取绑定的快照是"当前在途
+   消息"，卡片消息成功后紧跟的文件消息若尚未进入 prompt 在途，工具会如实
+   返回无附件自纠文案。复测"先发文件再一句话指令"即可正常统计；该行为
+   与无沙箱模式一致（快照生命周期设计使然），非沙箱引入的回归。
