@@ -201,6 +201,9 @@ func TestRunTurnFinalRoundOnly(t *testing.T) {
 	}}
 	final2, err := RunTurn(context.Background(), client2, ChatRequest{}, exec.exec,
 		func(string) error { return nil }, TurnOptions{FinalRoundOnly: true})
+	if !errors.Is(err, errAbort) {
+		t.Errorf("出错时错误应原样传回: %v", err)
+	}
 	if final2 != "前半" {
 		t.Errorf("出错时应回退全程累积文本: %q", final2)
 	}

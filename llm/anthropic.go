@@ -36,10 +36,10 @@ type AnthropicOptions struct {
 // NewAnthropicClient 创建 Anthropic 客户端，校验必填项。
 func NewAnthropicClient(opts AnthropicOptions) (*AnthropicClient, error) {
 	if opts.APIKey == "" {
-		return nil, fmt.Errorf("Anthropic 客户端缺少 APIKey")
+		return nil, fmt.Errorf("创建 Anthropic 客户端需要先提供 apiKey")
 	}
 	if opts.Model == "" {
-		return nil, fmt.Errorf("Anthropic 客户端缺少 Model")
+		return nil, fmt.Errorf("创建 Anthropic 客户端需要先提供 model")
 	}
 	if opts.BaseURL == "" {
 		opts.BaseURL = DefaultAnthropicBaseURL

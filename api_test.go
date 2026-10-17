@@ -63,7 +63,7 @@ func TestDownloadFileRejectsOversizedBody(t *testing.T) {
 	t.Run("分块返回（无 Content-Length）", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// 不设 Content-Length，直接分块写超过上限的数据
-			for i := 0; i < 10; i++ {
+			for range 10 {
 				_, _ = w.Write(make([]byte, cap/2))
 				w.(http.Flusher).Flush()
 			}

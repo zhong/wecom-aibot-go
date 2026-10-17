@@ -16,3 +16,4 @@ coverage.html
 .idea/
 .vscode/
 .DS_Store
+.loopx/
