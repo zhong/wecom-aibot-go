@@ -258,6 +258,44 @@ final, err := llm.AgentReply(ctx, bot, msg, wecomaibot.GenerateReqID("stream"),
 > 不可达；应在对应的 `OnTemplateCardEvent` / `OnEnterChat` 处理器里
 > 确定性完成（见 `examples/llm-bot`）。
 
+## 对接外部 Agent（ACP）
+
+`llm` 包是内置轻量模式（LLM 直连在连接层）；当大脑换成外部成熟 agent
+（pi、Claude Code 等）时，`acp` 包提供标准会话面：经 ACP
+（[Agent Client Protocol](https://agentclientprotocol.com)，JSON-RPC 2.0
+over stdio）把企微消息桥接给 agent——每条企微推送变成一次发往持久
+ACP 会话的 `session/prompt`，agent 的 `agent_message_chunk` 流实时映射为
+企微流式回复帧（打字机），同一企微会话跨消息天然获得对话记忆。
+
+```go
+router, err := acp.NewRouter(ctx, bot, acp.AgentConfig{
+    Command: "pi-acp", // ACP 适配器（pi 经 pi-acp，Claude Code 经 claude-agent-acp）
+})
+if err != nil { ... }
+acp.RouterBind(bot, router) // 绑定后文本/语音/图片/文件/视频/图文自动路由
+bot.Connect()
+```
+
+架构分工（连接层只管会话面，工具面归 agent）：
+
+```
+企微 ⇄ 本SDK（acp.Router = ACP client + 会话路由 + 打字机桥）
+         ├─ 会话面: ACP session/prompt ⇄ 外部 agent 子进程
+         └─ 工具面: agent 侧自行接入（MCP 等），不经连接层转发
+```
+
+- `acp.NewRouter(...)` — 拉起 ACP 适配器子进程、完成 initialize 握手；
+  每个企微会话（群聊 chatid / 单聊 userid）一个持久 agent 会话
+- `acp.RouterBind(bot, router)` — 绑定全部消息回调，自动组装用户文本
+  （语音用企微转写、附件转发为元信息提示）
+- `acp.Router.Handle(...)` — 手动路由单条消息（自定义组装时用）
+- 无人值守权限：agent 发来的 `session/request_permission` 默认自动拒绝
+  （安全缺省），`AgentConfig.Permission` 可注入自定义策略；
+  适配器在会话建立后推送的 startup info 块按协议时机过滤，不会渲染给用户
+- 完整示例见 `examples/acp-bot`（`ACP_COMMAND=pi-acp` 即可跑通 pi，
+  前置配置见 [pi 文档](https://github.com/badlogic/pi-mono)：
+  `~/.pi/agent/settings.json` 设 `quietStartup: true` 与默认模型）
+
 ## 文件下载与解密
 
 ```go
@@ -306,9 +344,11 @@ wecom-aibot-go/
   types.go          协议类型、常量与配置
   utils.go          req_id 生成
   llm/              大模型对接子包（OpenAI 兼容 + Anthropic + 流式桥 + 工具调用）
+  acp/              外部 agent 桥接子包（ACP client + 会话路由 + 打字机桥）
   examples/main.go
   examples/production/main.go
   examples/llm-bot/main.go
+  examples/acp-bot/main.go
   .github/workflows/ci.yml
   LICENSE
 ```
