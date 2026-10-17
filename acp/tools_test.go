@@ -351,3 +351,32 @@ func TestHandleSnapshotLifecycle(t *testing.T) {
 		t.Errorf("应先 Set 后 Clear: %v", s)
 	}
 }
+
+// TestRouterBindQuotedAttachmentHint RouterBind 对引用附件的文本消息组装：
+// 群聊里独立附件不产生回调，用户以「引用附件 @机器人」送达——prompt 应
+// 带提示行，附件本体由 read_attachment 工具读取；无附件引用不加提示。
+func TestRouterBindQuotedAttachmentHint(t *testing.T) {
+	tests := []struct {
+		name    string
+		quote   *wecomaibot.QuoteContent
+		wantHit bool
+	}{
+		{"无引用", nil, false},
+		{"引用纯文本", &wecomaibot.QuoteContent{MsgType: "text",
+			Text: &wecomaibot.TextContent{Content: "被引用"}}, false},
+		{"引用图片", &wecomaibot.QuoteContent{MsgType: "image",
+			Image: &wecomaibot.ImageContent{URL: "https://x/i.png"}}, true},
+		{"引用文件", &wecomaibot.QuoteContent{MsgType: "file",
+			File: &wecomaibot.FileContent{URL: "https://x/f.txt"}}, true},
+	}
+	for _, tt := range tests {
+		got := textWithQuoteHint("帮我看看", tt.quote)
+		want := "帮我看看"
+		if tt.wantHit {
+			want += "\n[用户引用了一个附件，可用 read_attachment 读取]"
+		}
+		if got != want {
+			t.Errorf("%s: 组装结果不对\n got=%q\nwant=%q", tt.name, got, want)
+		}
+	}
+}

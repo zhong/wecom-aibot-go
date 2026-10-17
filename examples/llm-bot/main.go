@@ -216,7 +216,13 @@ func registerLLMHandlers(bot *wecomaibot.Client, client llm.Client, systemPrompt
 
 	bot.OnText(func(_ context.Context, msg wecomaibot.TextMessage) {
 		safeGo("LLM 文本处理", func() {
-			handle("text", chatKeyOf(msg.ChatID, msg.From.UserID), msg.Text.Content, msg)
+			content := msg.Text.Content
+			// 群聊里独立图片/文件不产生回调，用户会以「引用附件 @机器人」的方式
+			// 送达附件：提示模型用 read_attachment 读取被引用的附件本体。
+			if msg.Quote != nil && (msg.Quote.Image != nil || msg.Quote.File != nil || msg.Quote.Mixed != nil) {
+				content += "\n[用户引用了一个附件，可用 read_attachment 读取]"
+			}
+			handle("text", chatKeyOf(msg.ChatID, msg.From.UserID), content, msg)
 		})
 	})
 

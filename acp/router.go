@@ -119,7 +119,7 @@ func RouterBind(bot *wecomaibot.Client, r *Router) {
 		}
 	}
 	bot.OnText(func(ctx context.Context, m wecomaibot.TextMessage) {
-		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, m.Text.Content)
+		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, textWithQuoteHint(m.Text.Content, m.Quote))
 	})
 	bot.OnVoice(func(ctx context.Context, m wecomaibot.VoiceMessage) {
 		// 语音已被企微转写（VoiceContent 无下载 URL，只有转写文本）
@@ -144,6 +144,19 @@ func RouterBind(bot *wecomaibot.Client, r *Router) {
 		}
 		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, string(sb))
 	})
+}
+
+// textWithQuoteHint 组装文本消息的 prompt：群聊里独立图片/文件不产生
+// 回调，用户会以「引用附件 @机器人」的方式送达附件——给 agent 一句提示，
+// 附件本体由 read_attachment 工具读取；引用纯文本/无引用不加提示。
+func textWithQuoteHint(content string, quote *wecomaibot.QuoteContent) string {
+	if quote == nil {
+		return content
+	}
+	if quote.Image != nil || quote.File != nil || quote.Mixed != nil {
+		return content + "\n[用户引用了一个附件，可用 read_attachment 读取]"
+	}
+	return content
 }
 
 // chatKeyOf 生成路由键：群聊用 ChatID；单聊没有 ChatID 时用 userid。

@@ -71,12 +71,12 @@ func WeComToolDefs() []ToolDef {
 		},
 		{
 			Name: "read_attachment",
-			Description: "读取用户在本条消息里发来的附件内容（文件/图片/语音/视频/图文混排）。" +
-				"选型指引：只要当前消息携带了附件且内容对回答有必要——例如用户发来一份名单" +
-				"文件让你统计、或发文档让你总结——就先调用本工具拿到附件内容再作答，" +
-				"不要凭空猜测附件内容。文本类附件（txt/csv/md/json 等）返回文本内容预览；" +
-				"图片/音视频等二进制附件返回文件名与大小等元信息。无需参数：读取目标由" +
-				"当前消息决定。",
+			Description: "读取用户在本条消息里发来的附件内容（文件/图片/语音/视频/图文混排，" +
+				"以及用户引用的图片/文件/图文混排）。选型指引：只要当前消息携带了附件或引用了" +
+				"附件且内容对回答有必要——例如用户发来一份名单文件让你统计、或引用一张图片" +
+				"让你看图作答——就先调用本工具拿到附件信息再作答，不要凭空猜测附件内容。" +
+				"文本类附件（txt/csv/md/json 等）返回文本内容预览；图片/音视频等二进制附件" +
+				"返回文件名与大小等元信息。无需参数：读取目标由当前消息决定。",
 			Parameters: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
@@ -177,11 +177,11 @@ const readAttachmentMaxSize = 10 * 1024 * 1024
 // 经 DownloadFile 下载（aeskey 可得时 AES 解密）。文本类返回截断内容预览，
 // 二进制（图片/音视频等）返回文件名与大小元信息；无附件返回明确结果。
 func execReadAttachment(ctx context.Context, bot *wecomaibot.Client, req wecomaibot.RequestCarrier) (string, error) {
-	att, ok := attachmentOf(req)
+	attachment, ok := attachmentOf(req)
 	if !ok {
 		return toolResultJSON(false, 0, "当前消息没有附件"), nil
 	}
-	downloaded, err := bot.DownloadFile(att.url, att.aesKey)
+	downloaded, err := bot.DownloadFile(attachment.url, attachment.aesKey)
 	if err != nil {
 		return toolResultJSON(false, 0, "下载附件失败: "+err.Error()), nil
 	}
@@ -189,7 +189,7 @@ func execReadAttachment(ctx context.Context, bot *wecomaibot.Client, req wecomai
 		return toolResultJSON(false, 0,
 			fmt.Sprintf("附件过大（%d 字节，超过 %d MiB 上限）", len(downloaded.Buffer), readAttachmentMaxSize/1024/1024)), nil
 	}
-	if isTextual(downloaded.Filename, att.msgType) || sniffTextual(downloaded.Buffer) {
+	if isTextual(downloaded.Filename, attachment.msgType) || sniffTextual(downloaded.Buffer) {
 		preview := string(downloaded.Buffer)
 		truncated := false
 		if len(preview) > readAttachmentPreviewLimit {
@@ -201,7 +201,7 @@ func execReadAttachment(ctx context.Context, bot *wecomaibot.Client, req wecomai
 		}
 		return attachmentTextJSON(downloaded.Filename, len(downloaded.Buffer), preview, truncated), nil
 	}
-	return attachmentMetaJSON(downloaded.Filename, att.msgType, len(downloaded.Buffer)), nil
+	return attachmentMetaJSON(downloaded.Filename, attachment.msgType, len(downloaded.Buffer)), nil
 }
 
 // reqAttachment 是从消息载体提取出的单个附件。
@@ -212,7 +212,9 @@ type reqAttachment struct {
 }
 
 // attachmentOf 判断消息是否携带附件并提取 url/aeskey。图文混排取首个
-// 携带 url 的项；同一消息的多附件场景取第一项并在结果里说明。
+// 携带 url 的项；引用消息（群聊 @机器人引用图片的用户文本）取被引用
+// 载荷里的附件——群聊里独立图片消息不产生回调，引用是官方可达路径；
+// 同一消息的多附件场景取第一项并在结果里说明。
 func attachmentOf(req wecomaibot.RequestCarrier) (*reqAttachment, bool) {
 	switch m := req.(type) {
 	case wecomaibot.FileMessage:
@@ -225,6 +227,26 @@ func attachmentOf(req wecomaibot.RequestCarrier) (*reqAttachment, bool) {
 			return nil, false
 		}
 		return &reqAttachment{url: m.Image.URL, aesKey: m.Image.AESKey, msgType: "image"}, true
+	case wecomaibot.TextMessage:
+		// 用户引用消息 @机器人（msgtype=text，quote 载被引用内容）：
+		// 被引用的图片/文件/混排图片都按本条消息的附件处理。
+		if m.Quote == nil {
+			return nil, false
+		}
+		q := m.Quote
+		switch {
+		case q.Image != nil && q.Image.URL != "":
+			return &reqAttachment{url: q.Image.URL, aesKey: q.Image.AESKey, msgType: "image"}, true
+		case q.File != nil && q.File.URL != "":
+			return &reqAttachment{url: q.File.URL, aesKey: q.File.AESKey, msgType: "file"}, true
+		case q.Mixed != nil:
+			for _, item := range q.Mixed.MsgItem {
+				if item.Image != nil && item.Image.URL != "" {
+					return &reqAttachment{url: item.Image.URL, aesKey: item.Image.AESKey, msgType: "mixed"}, true
+				}
+			}
+		}
+		return nil, false
 	case wecomaibot.VoiceMessage:
 		// 语音已被企微转写为 Text.Content 直接可读，无附件可下载。
 		return nil, false
