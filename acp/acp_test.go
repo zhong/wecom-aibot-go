@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -219,6 +220,14 @@ func fakeAdapterMain() {
 						map[string]any{"optionId": "reject-1", "kind": "reject_once", "name": "拒绝"},
 					}}})
 			}
+			// 延迟模式（钉占位帧时序用）：prompt 后静默 FAKE_ADAPTER_DELAY_MS
+			// 毫秒才推首 chunk，验证占位帧无需求等首 chunk。
+			if d := os.Getenv("FAKE_ADAPTER_DELAY_MS"); d != "" {
+				var ms int
+				if n, _ := fmt.Sscanf(d, "%d", &ms); n == 1 && ms > 0 {
+					time.Sleep(time.Duration(ms) * time.Millisecond)
+				}
+			}
 			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "method": "session/update",
 				"params": map[string]any{"sessionId": "s_1", "update": map[string]any{
 					"sessionUpdate": "agent_message_chunk",
@@ -293,10 +302,17 @@ func fakeMCPInvoke(tool string) string {
 
 // fakeAdapterConfig 用测试二进制自身当 ACP 适配器。
 func fakeAdapterConfig() AgentConfig {
+	return fakeAdapterConfigEnv()
+}
+
+// fakeAdapterConfigEnv 用测试二进制自身当 ACP 适配器，附加环境变量
+// （如 FAKE_ADAPTER_DELAY_MS：prompt 后延迟若干毫秒才推首个正文 chunk，
+// 模拟 pi 首chunk 前的 spawn/思考/工具调用静默期）。
+func fakeAdapterConfigEnv(extra ...string) AgentConfig {
 	return AgentConfig{
 		Command: os.Args[0],
 		Args:    []string{"-test.run=TestMain", "--"},
-		Env:     append(os.Environ(), "FAKE_ACP_ADAPTER=1"),
+		Env:     append(os.Environ(), append([]string{"FAKE_ACP_ADAPTER=1"}, extra...)...),
 	}
 }
 
@@ -355,6 +371,52 @@ func TestRouterEndToEnd(t *testing.T) {
 	// 占位帧在前：首个流式帧应为占位文案且非结束
 	if frames[0].Content != DefaultPlaceholder || frames[0].Finish {
 		t.Errorf("首帧应为占位帧: %+v", frames[0])
+	}
+}
+
+// TestPlaceholderBeforeFirstChunk 钉住占位帧时序：假适配器 prompt 后
+// 静默 2 秒才推首个正文 chunk（模拟 pi 首 chunk 前 spawn/思考/工具调用
+// 的漫长静默期）——静默期内（prompt 尚未返回时）占位帧必须已经落到
+// 企微服务端，用户立即看到「正在思考...」而非毫无反应。
+func TestPlaceholderBeforeFirstChunk(t *testing.T) {
+	srv := newACPWSServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	placeholderSeen := make(chan wecomaibot.StreamPayload, 1)
+	connectACPBot(t, srv, func(bot *wecomaibot.Client, msg wecomaibot.TextMessage) {
+		router, err := NewRouter(ctx, bot, fakeAdapterConfigEnv("FAKE_ADAPTER_DELAY_MS=2000"))
+		if err != nil {
+			t.Errorf("NewRouter: %v", err)
+			return
+		}
+		// Handle 内部的占位帧是阻塞发送，返回前必已落服务端；这里在
+		// prompt 在途时并发观察帧记录，断言不等首 chunk。
+		go func() {
+			deadline := time.Now().Add(20 * time.Second)
+			for time.Now().Before(deadline) {
+				for _, f := range srv.streamFrames() {
+					if f.Content == DefaultPlaceholder && !f.Finish {
+						select {
+						case placeholderSeen <- f:
+						default:
+						}
+						return
+					}
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		}()
+		if _, err := router.Handle(ctx, "chat_1", msg, "你好", "sid_p"); err != nil {
+			t.Errorf("Handle: %v", err)
+		}
+	})
+
+	// 静默期内（远早于 2 秒延迟结束）占位帧必须已出现
+	select {
+	case <-placeholderSeen:
+	case <-time.After(1500 * time.Millisecond):
+		t.Error("首 chunk 静默期内未出现占位帧：占位帧仍在等待首个正文 chunk")
 	}
 }
 

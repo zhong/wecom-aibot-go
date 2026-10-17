@@ -26,9 +26,8 @@ type session struct {
 	// req 当前消息载体（流式帧 req_id 的来源）；streamID 本轮流式帧 ID
 	req      wecomaibot.RequestCarrier
 	streamID string
-	// content 已累积正文；sawPlaceholder 已发占位帧
-	content        string
-	sawPlaceholder bool
+	// content 已累积正文
+	content string
 	// prompting prompt 在途标位：仅此期间收到的 chunk 才计入正文
 	// （pi-acp 等适配器在 session/new 后会推送 startup info 块，
 	// 必须按协议时机过滤，不能按内容猜。）
@@ -51,10 +50,6 @@ func (s *session) handleUpdate(raw map[string]any) {
 	if !s.prompting {
 		// prompt 外的 chunk（startup info、排队通知等系统文本）不入正文
 		return
-	}
-	if !s.sawPlaceholder && s.req != nil {
-		_, _ = s.bot.ReplyStreamByID(s.req, s.streamID, DefaultPlaceholder, false, nil, nil)
-		s.sawPlaceholder = true
 	}
 	s.content += text
 	if s.req == nil {
@@ -97,14 +92,23 @@ func textOf(block map[string]any) string {
 func (s *session) ask(ctx context.Context, userText string) string {
 	s.mu.Lock()
 	s.prompting = true
+	req := s.req
+	streamID := s.streamID
 	s.mu.Unlock()
+
+	// 占位帧在 prompt 发出之前阻塞发出（对齐 llm 包 streamBridge.begin）：
+	// pi 等适配器首个正文 chunk 前有 spawn/握手/思考/工具调用的漫长静默期，
+	// 先让用户立刻看到「正在思考...」确认消息已收到。
+	if req != nil {
+		_, _ = s.bot.ReplyStreamByID(req, streamID, DefaultPlaceholder, false, nil, nil)
+	}
 
 	stop, err := s.proc.prompt(ctx, s.acpID, userText)
 
 	s.mu.Lock()
 	s.prompting = false
 	final := s.content
-	req := s.req
+	req = s.req
 	s.mu.Unlock()
 
 	if final == "" {
@@ -130,13 +134,13 @@ func (s *session) ask(ctx context.Context, userText string) string {
 }
 
 // begin 为新一轮企微消息重置会话状态（新载体、新流、正文清零）。
+// 占位帧不在这里发：ask 在 prompt 发出前发（见 ask）。
 func (s *session) begin(req wecomaibot.RequestCarrier, streamID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.req = req
 	s.streamID = streamID
 	s.content = ""
-	s.sawPlaceholder = false
 }
 
 // extractChatID 从消息载体提取 ChatID（终帧失败的降级发送目标）；
