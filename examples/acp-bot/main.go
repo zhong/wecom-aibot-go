@@ -33,6 +33,20 @@
 //	ACP_TOOLS        置 1 时启用企微工具面（可选）
 //	ACP_TOOL_WORKDIR 会话 agent 目录基址（可选，默认 ~/.wecom-aibot/acp-work；
 //	                 须跨重启稳定——trust 登记按路径生效）
+//	ACP_TOOL_ADDR    工具面监听地址（可选，默认仅回环随机端口）。agent 跑在
+//	                 容器里时填容器可达的宿主侧地址，如 Apple container 的
+//	                 容器网关 "192.168.64.1:0"——TOOLS 端点直接监听网关，
+//	                 agent 里的 URL 自动正确，无需转发器
+//	ACP_MCP_ADVERTISE_URL  工具面通告基址（可选）。agent 跑在 docker 容器
+//	                 （如 OrbStack）里而监听仍是回环时，通告基址设
+//	                 http://host.docker.internal，写进 agent 配置的
+//	                 URL 才是容器视角可达地址
+//	ACP_HOSTFWD       宿主回环转发（可选，Apple container 沙箱路线用）：
+//	                 逗号分隔的「对外端口:回环目标」，如 "3425:3425"。
+//	                 本进程内把容器网关端口转发到 127.0.0.1——外部服务
+//	                 （LLM 代理等）零改动即容器可达；docker 路线不需要
+//	ACP_HOSTFWD_BIND  转发监听地址（可选，默认容器网关 192.168.64.1——
+//	                 Apple container 宿主网桥 IP）
 package main
 
 import (
@@ -110,14 +124,36 @@ func main() {
 		if err != nil {
 			log.Fatalf("启动工具面服务端失败: %v", err)
 		}
-		if err := mcpSrv.Start(mcp.DefaultAddr); err != nil {
-			log.Fatalf("工具面服务端监听失败: %v", err)
+		// 沙箱 agent 部署的二选一（见包注释环境变量说明）：
+		// 直接监听容器可达地址（省转发器）或回环 + 通告覆盖。
+		listenAddr := mcp.DefaultAddr
+		if addr := os.Getenv("ACP_TOOL_ADDR"); addr != "" {
+			listenAddr = addr
+		}
+		if advertise := os.Getenv("ACP_MCP_ADVERTISE_URL"); advertise != "" {
+			mcpSrv.SetAdvertiseBase(advertise)
+		}
+		if err := mcpSrv.Start(listenAddr); err != nil {
+			log.Fatalf("工具面服务端监听 %s 失败: %v", listenAddr, err)
 		}
 		defer mcpSrv.Close()
 		if err := router.EnableTools(mcpSrv, workDir); err != nil {
 			log.Fatalf("启用工具面失败: %v", err)
 		}
 		log.Printf("工具面已启用: %s（会话目录 %s）", mcpSrv.URLFor("chatid"), workDir)
+	}
+
+	// 沙箱 agent 部署的宿主回环转发（Apple container 路线归宿 B，可选）：
+	// 容器经网关访问宿主，但外部服务（LLM 代理等）只监听回环时，
+	// 在本进程内把网关端口转发到回环——外部服务零改动，转发随 bot 存活。
+	// docker/OrbStack 不需要（host.docker.internal 桥接全部回环端口）。
+	if spec := os.Getenv("ACP_HOSTFWD"); spec != "" {
+		fwd, err := startHostForwards(spec)
+		if err != nil {
+			log.Fatalf("启动宿主转发失败: %v", err)
+		}
+		defer func() { _ = fwd.Close() }()
+		log.Printf("宿主回环转发已启用: %s", spec)
 	}
 
 	acp.RouterBind(bot, router)

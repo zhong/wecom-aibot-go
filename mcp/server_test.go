@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -507,6 +508,44 @@ func TestChatKeyEscapeRoundTrip(t *testing.T) {
 		if err != nil || got != key {
 			t.Errorf("往返失败: %q → %q → %q (err=%v)", key, esc, got, err)
 		}
+	}
+}
+
+// TestSetAdvertiseBase 通告基址覆盖：容器化 agent 部署里监听回环、
+// 通告容器视角可达地址（host.docker.internal / 容器网关），URLFor 写进
+// agent 配置的端点才真正可达。不带 scheme 自动补 http。
+func TestSetAdvertiseBase(t *testing.T) {
+	e := newTestEnv(t, "")
+	// 缺省：通告 = 实际监听地址
+	if got, want := e.mcp.URL(), "http://"+e.mcp.Addr(); got != want {
+		t.Errorf("缺省 URL = %q, 期望 %q", got, want)
+	}
+	e.mcp.SetAdvertiseBase("host.docker.internal:8080")
+	if got := e.mcp.URL(); got != "http://host.docker.internal:8080" {
+		t.Errorf("通告 URL = %q, 期望 http://host.docker.internal:8080", got)
+	}
+	if got := e.mcp.URLFor("chat_1"); got != "http://host.docker.internal:8080/mcp/chat_1" {
+		t.Errorf("URLFor = %q, 期望通告基址拼会话路径", got)
+	}
+	// 显式 scheme 原样保留
+	e.mcp.SetAdvertiseBase("https://gw.example")
+	if got := e.mcp.URL(); got != "https://gw.example" {
+		t.Errorf("显式 scheme URL = %q, 期望原样", got)
+	}
+	// 通告不影响实际监听（请求仍落在真实端口）
+	e.mcp.SetAdvertiseBase("host.docker.internal:8080")
+	if _, err := net.Dial("tcp", e.mcp.Addr()); err != nil {
+		t.Errorf("实际监听地址不可达: %v", err)
+	}
+	// clientFor 走通告地址打不通（本机没有该 DNS 场景），但直打真实端口
+	// 带鉴权 tools/list 正常——通告只影响写进配置的字符串，不影响服务。
+	u := "http://" + e.mcp.Addr() + "/mcp/chat_1"
+	c := &mcpClient{base: u, token: e.mcp.Token(), http: &http.Client{}}
+	out := c.call(t, 1, "tools/list", map[string]any{})
+	res, _ := out["result"].(map[string]any)
+	tools, _ := res["tools"].([]any)
+	if len(tools) == 0 {
+		t.Errorf("tools/list 空: %v", out)
 	}
 }
 
