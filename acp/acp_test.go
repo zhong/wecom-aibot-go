@@ -2,8 +2,10 @@ package acp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -84,6 +86,15 @@ func (s *acpWSServer) record(frame wecomaibot.WsFrameRaw) {
 	s.frames = append(s.frames, frame)
 }
 
+// recorded 返回已记录帧的副本（供工具面集成测试检查主动发送帧）。
+func (s *acpWSServer) recorded() []wecomaibot.WsFrameRaw {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]wecomaibot.WsFrameRaw, len(s.frames))
+	copy(out, s.frames)
+	return out
+}
+
 // streamFrames 依序返回流式回复帧（body.stream 内容非空）。
 func (s *acpWSServer) streamFrames() []wecomaibot.StreamPayload {
 	s.mu.Lock()
@@ -148,12 +159,17 @@ func TestMain(m *testing.M) {
 // fakeAdapterMain 假适配器主循环：initialize/session/new/session/prompt 各就其位。
 // prompt 前（模拟 pi-acp）先推一条 startup info chunk；收到 prompt 后
 // 先发 request_permission，得到答复后推送两条正文 chunk 并返回 end_turn。
+// prompt 文本带 "TOOLCALL:<tool>" 前缀时（工具面集成测试专用），假适配器
+// 转身以 MCP 客户端身份调用 TEST_MCP_URL 端点执行工具，把 prompt 原文、
+// 会话 cwd、工具结果一并回显成 chunk——对应现实里 pi 经项目 .pi/mcp.json
+// 调用 mcp__wecom__* 工具的行为。
 func fakeAdapterMain() {
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	enc := json.NewEncoder(os.Stdout)
 
 	var sessionReady bool
+	var sessionCwd string
 	sawPrompt := 0
 	for sc.Scan() {
 		var req struct {
@@ -170,6 +186,9 @@ func fakeAdapterMain() {
 				"result": map[string]any{"protocolVersion": 1, "authMethods": []any{}}})
 		case "session/new":
 			sessionReady = true
+			if cwd, ok := req.Params["cwd"].(string); ok {
+				sessionCwd = cwd
+			}
 			// startup info：session/new 后、prompt 前推送（对齐 pi-acp 行为）
 			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "method": "session/update",
 				"params": map[string]any{"sessionId": "s_1", "update": map[string]any{
@@ -180,6 +199,18 @@ func fakeAdapterMain() {
 				"result": map[string]any{"sessionId": "s_1"}})
 		case "session/prompt":
 			sawPrompt++
+			promptText := promptTextOf(req.Params)
+			if tool, ok := strings.CutPrefix(promptText, "TOOLCALL:"); ok {
+				text := fakeMCPInvoke(tool)
+				_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "method": "session/update",
+					"params": map[string]any{"sessionId": "s_1", "update": map[string]any{
+						"sessionUpdate": "agent_message_chunk",
+						"content":       []any{map[string]any{"type": "text", "text": "ECHO|" + promptText + "|CWD|" + sessionCwd + "|TOOL|" + text}},
+					}}})
+				_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "id": *req.ID,
+					"result": map[string]any{"stopReason": "end_turn"}})
+				continue
+			}
 			// 权限请求（首次 prompt 才发）
 			if sawPrompt == 1 {
 				_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "id": 900, "method": "session/request_permission",
@@ -203,6 +234,61 @@ func fakeAdapterMain() {
 		}
 	}
 	_ = sessionReady
+}
+
+// promptTextOf 从 session/prompt 参数里解出第一条文本。
+func promptTextOf(params map[string]any) string {
+	arr, ok := params["prompt"].([]any)
+	if !ok || len(arr) == 0 {
+		return ""
+	}
+	m, ok := arr[0].(map[string]any)
+	if !ok {
+		return ""
+	}
+	text, _ := m["text"].(string)
+	return text
+}
+
+// fakeMCPInvoke 让假适配器以 MCP 客户端身份调用工具端点（URL/token 经
+// 环境变量 TEST_MCP_URL / TEST_MCP_TOKEN 注入）。
+func fakeMCPInvoke(tool string) string {
+	body := map[string]any{
+		"jsonrpc": "2.0", "method": "tools/call",
+		"params": map[string]any{"name": tool, "arguments": map[string]any{"content": "## 名单\n- 张三"}},
+		"id":     1,
+	}
+	b, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, os.Getenv("TEST_MCP_URL"), bytes.NewReader(b))
+	if err != nil {
+		return "MCPERR:" + err.Error()
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("TEST_MCP_TOKEN"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "MCPERR:" + err.Error()
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+		Error any `json:"error"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return "MCPERR:" + string(data)
+	}
+	if out.Error != nil {
+		return "MCPERR:" + string(data)
+	}
+	if len(out.Result.Content) == 0 {
+		return "MCPERR:无 content 结果"
+	}
+	return out.Result.Content[0].Text
 }
 
 // fakeAdapterConfig 用测试二进制自身当 ACP 适配器。
@@ -288,7 +374,7 @@ func TestAnswerPermissionDefaultReject(t *testing.T) {
 	// 与 fake adapter 握一轮 prompt：触发的 request_permission 由
 	// answerPermission 自动应答（默认拒绝），prompt 正常收尾即证明
 	// 应答闭环没有卡死。
-	sid, err := proc.newSessionOnly(ctx)
+	sid, err := proc.newSessionOnly(ctx, "/tmp")
 	if err != nil {
 		t.Fatalf("session/new: %v", err)
 	}
