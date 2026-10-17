@@ -587,3 +587,92 @@ func TestToolsCallReadAttachmentSave(t *testing.T) {
 		t.Fatalf("落盘文件应可读且字节一致: err=%v len=%d", err, len(buf))
 	}
 }
+
+// ---- 外发频控 E2E（SetSendMinInterval + tools/call 闭环） ----
+
+// TestSendRateLimitBlocksSecondBurst 验证频控对注入滥用形态的拦截：
+// 窗口内第二次 send_markdown 被 ok:false 拒绝且不产生第二条主动发送帧，
+// 等待文案随剩余时长返回（模型可自纠）。
+func TestSendRateLimitBlocksSecondBurst(t *testing.T) {
+	e := newTestEnv(t, "")
+	e.mcp.SetSendMinInterval(10 * time.Second)
+
+	first := e.runInChat(t, "chat_1", e.msg, "send_markdown", `{"content":"第一条"}`)
+	if !strings.Contains(first, `"ok":true`) {
+		t.Fatalf("首发应放行: %s", first)
+	}
+	second := e.runInChat(t, "chat_1", e.msg, "send_markdown", `{"content":"第二条"}`)
+	if !strings.Contains(second, `"ok":false`) || !strings.Contains(second, "发送过于频繁") {
+		t.Fatalf("窗口内第二次应被频控拒绝: %s", second)
+	}
+	time.Sleep(200 * time.Millisecond)
+	frames := e.ws.sendMsgFrames()
+	if len(frames) != 1 {
+		t.Fatalf("被限请求不应产生第二条发送帧, 实际 %d 条", len(frames))
+	}
+}
+
+// TestSendRateLimitCrossChatIndependent 验证频控按会话隔离：
+// chat_1 被限不影响 chat_2 首发。
+func TestSendRateLimitCrossChatIndependent(t *testing.T) {
+	e := newTestEnv(t, "")
+	e.mcp.SetSendMinInterval(10 * time.Second)
+
+	msg2 := e.msg
+	msg2.ChatID = "chat_2"
+
+	if out := e.runInChat(t, "chat_1", e.msg, "send_markdown", `{"content":"a"}`); !strings.Contains(out, `"ok":true`) {
+		t.Fatalf("chat_1 首发应放行: %s", out)
+	}
+	if out := e.runInChat(t, "chat_2", msg2, "send_markdown", `{"content":"b"}`); !strings.Contains(out, `"ok":true`) {
+		t.Fatalf("chat_2 应独立放行: %s", out)
+	}
+}
+
+// TestSendRateLimitFailedSendNotConsumed 验证发送失败不消耗频控额度：
+// 失败（无法定位会话的载体）后立刻重试合法发送仍放行。
+func TestSendRateLimitFailedSendNotConsumed(t *testing.T) {
+	e := newTestEnv(t, "")
+	e.mcp.SetSendMinInterval(10 * time.Second)
+
+	// 参数校验失败（content 为空）：未触达发送面，应 ok:false 且不消耗额度。
+	failed := e.runInChat(t, "chat_1", e.msg, "send_markdown", `{"content":""}`)
+	if !strings.Contains(failed, `"ok":false`) {
+		t.Fatalf("空 content 应执行失败: %s", failed)
+	}
+	// 失败已 release：同会话紧接着的合法发送不再被挡。
+	if out := e.runInChat(t, "chat_1", e.msg, "send_markdown", `{"content":"ok one"}`); !strings.Contains(out, `"ok":true`) {
+		t.Fatalf("失败的发送不应消耗额度: %s", out)
+	}
+}
+
+// TestSendRateLimitDisabledByZero 频控置 0 等价关闭：连发全放行。
+func TestSendRateLimitDisabledByZero(t *testing.T) {
+	e := newTestEnv(t, "")
+	e.mcp.SetSendMinInterval(0)
+
+	for i := 0; i < 3; i++ {
+		if out := e.runInChat(t, "chat_1", e.msg, "send_markdown", `{"content":"burst"}`); !strings.Contains(out, `"ok":true`) {
+			t.Fatalf("频控关闭后第 %d 次应放行: %s", i, out)
+		}
+	}
+}
+
+// TestSendRateLimitNotAffectReadAttachment 频控只作用于外发类工具：
+// read_attachment 只读不受限（连发多次都正常执行）。
+func TestSendRateLimitNotAffectReadAttachment(t *testing.T) {
+	e := newTestEnv(t, "")
+	e.mcp.SetSendMinInterval(10 * time.Second)
+
+	fmsg := wecomaibot.FileMessage{}
+	fmsg.ReqID = "msg_req_f"
+	fmsg.ChatID = "chat_1"
+	fmsg.File.URL = "http://127.0.0.1:1/a.txt" // 下载会失败，但工具正常执行返回结果
+
+	for i := 0; i < 3; i++ {
+		out := e.runInChat(t, "chat_1", fmsg, "read_attachment", `{}`)
+		if strings.Contains(out, "发送过于频繁") {
+			t.Fatalf("read_attachment 不应被频控: %s", out)
+		}
+	}
+}

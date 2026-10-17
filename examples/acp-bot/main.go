@@ -47,6 +47,9 @@
 //	                 （LLM 代理等）零改动即容器可达；docker 路线不需要
 //	ACP_HOSTFWD_BIND  转发监听地址（可选，默认容器网关 192.168.64.1——
 //	                 Apple container 宿主网桥 IP）
+//	ACP_SEND_MIN_INTERVAL_MS  外发工具（send_template_card/send_markdown）
+//	                 每会话最小发送间隔毫秒（可选，缺省启用 mcp 包默认值
+//	                 防注入刷屏；置 0 关闭）
 package main
 
 import (
@@ -55,8 +58,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	wecomaibot "github.com/zhong/wecom-aibot-go"
 	"github.com/zhong/wecom-aibot-go/acp"
@@ -132,6 +137,17 @@ func main() {
 		}
 		if advertise := os.Getenv("ACP_MCP_ADVERTISE_URL"); advertise != "" {
 			mcpSrv.SetAdvertiseBase(advertise)
+		}
+		// 外发频控（防注入滥用发送面刷屏；沙箱管不住的面，连接层限速）
+		// ——缺省开（沙箱化与本地部署同受益），0 关闭，正值覆盖间隔。
+		if v := os.Getenv("ACP_SEND_MIN_INTERVAL_MS"); v != "" {
+			if ms, err := strconv.Atoi(v); err == nil {
+				mcpSrv.SetSendMinInterval(time.Duration(ms) * time.Millisecond)
+			} else {
+				log.Fatalf("ACP_SEND_MIN_INTERVAL_MS 需要毫秒整数，得到 %q", v)
+			}
+		} else {
+			mcpSrv.SetSendMinInterval(mcp.DefaultSendMinInterval)
 		}
 		if err := mcpSrv.Start(listenAddr); err != nil {
 			log.Fatalf("工具面服务端监听 %s 失败: %v", listenAddr, err)
