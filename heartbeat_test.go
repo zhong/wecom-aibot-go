@@ -245,7 +245,7 @@ func TestSendHeartbeatWriteFailureClosesConn(t *testing.T) {
 
 	w := newWSConnection(Config{}, silentTestLogger{})
 	w.setConn(conn)
-	w.sendHeartbeat()
+	w.sendHeartbeat(conn)
 	if w.isConnected() {
 		t.Error("心跳写失败后 conn 应被置空")
 	}
