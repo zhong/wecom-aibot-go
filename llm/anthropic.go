@@ -176,8 +176,10 @@ func (c *AnthropicClient) StreamChat(ctx context.Context, req ChatRequest, onDel
 // content_block_delta(input_json_delta) 累积，content_block_stop 时发出。
 //
 // 线协议事件集：message_start / content_block_start / content_block_delta /
-// content_block_stop / message_delta / message_stop / ping。除上述关心的
-// 事件外其余安全跳过。
+// content_block_stop / message_delta / message_stop / ping / error。
+// error 是流中途的差错事件（配额、过载、断流等）——不处理的话半截
+// 回复会被当正常完成（缺了 message_stop 的收尾兜底正是这种形态）。
+// 除上述关心的事件外其余安全跳过。
 func (c *AnthropicClient) StreamChatEvents(ctx context.Context, req ChatRequest, onEvent func(ev StreamEvent) error) (string, error) {
 	model := req.Model
 	if model == "" {
@@ -291,6 +293,19 @@ func (c *AnthropicClient) StreamChatEvents(ctx context.Context, req ChatRequest,
 			}
 		case "message_stop":
 			return finishReason, nil
+		case "error":
+			// 流中途差错：以错误返回结束本轮，不能落到下面的「视为
+			// 正常结束」兜底——否则配额/过载错误会伪装成空回复。
+			var ee struct {
+				Error struct {
+					Type    string `json:"type"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(data), &ee); err == nil && ee.Error.Message != "" {
+				return finishReason, fmt.Errorf("anthropic 流式响应中断: %s (%s)", ee.Error.Message, ee.Error.Type)
+			}
+			return finishReason, fmt.Errorf("anthropic 流式响应中断: 服务端返回 error 事件")
 		}
 	}
 	if err := scanner.Err(); err != nil {

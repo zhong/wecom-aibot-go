@@ -20,6 +20,7 @@ import (
 	"io"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 // DefaultPromptTimeoutMS 是一次 session/prompt（含 agent 全部工具轮）的
@@ -102,13 +103,16 @@ func (p *agentProc) readLoop(stdout io.ReadCloser) {
 		if json.Unmarshal(sc.Bytes(), &raw) != nil || raw == nil {
 			continue
 		}
-		id, hasID := raw["id"]
+		_, hasID := raw["id"]
 		_, hasMethod := raw["method"]
 		if hasID && !hasMethod {
-			// 响应
+			// 响应。id 无类型断言：适配器回字符串/bool id 的畸形帧
+			// 不应击穿整个进程（readLoop 是裸 goroutine，panic 即崩）。
+			id, _ := raw["id"].(float64)
+			idInt := int(id)
 			p.mu.Lock()
-			ch := p.pending[int(id.(float64))]
-			delete(p.pending, int(id.(float64)))
+			ch := p.pending[idInt]
+			delete(p.pending, idInt)
 			p.mu.Unlock()
 			if ch != nil {
 				ch <- raw
@@ -214,7 +218,7 @@ func (p *agentProc) reply(request map[string]any, result any) {
 	p.writeMu.Unlock()
 }
 
-// call 发请求并等响应；timeout 为 0 时不限时。
+// call 发请求并等响应；timeoutMS <= 0 时不限时。
 func (p *agentProc) call(ctx context.Context, method string, params any, timeoutMS int) (map[string]any, error) {
 	p.mu.Lock()
 	p.nextID++
@@ -236,13 +240,20 @@ func (p *agentProc) call(ctx context.Context, method string, params any, timeout
 
 	wait := (<-chan map[string]any)(ch)
 	if timeoutMS > 0 {
+		timer := time.NewTimer(time.Duration(timeoutMS) * time.Millisecond)
+		defer timer.Stop()
 		select {
 		case r := <-wait:
 			return r, nil
-		case <-ctx.Done():
+		case <-timer.C:
+			// 超时：丢弃响应通道。适配器迟到的响应到来时 readLoop 发现
+			// pending 里已没有该 id，自然丢弃——不留悬挂的等待者。
 			p.mu.Lock()
 			delete(p.pending, id)
 			p.mu.Unlock()
+			return nil, fmt.Errorf("ACP %s 等待响应超时（%dms）", method, timeoutMS)
+		case <-ctx.Done():
+			delete(p.pending, id)
 			return nil, ctx.Err()
 		}
 	}
@@ -250,6 +261,7 @@ func (p *agentProc) call(ctx context.Context, method string, params any, timeout
 	case r := <-wait:
 		return r, nil
 	case <-ctx.Done():
+		delete(p.pending, id)
 		return nil, ctx.Err()
 	}
 }
@@ -296,7 +308,9 @@ func (p *agentProc) newSessionOnly(ctx context.Context, cwd string) (string, err
 	if r["error"] != nil {
 		return "", fmt.Errorf("ACP session/new: %v", r["error"])
 	}
-	sid, _ := r["result"].(map[string]any)["sessionId"].(string)
+	// 逐层 comma-ok：适配器畸形响应（result 非对象）不应 panic。
+	res, _ := r["result"].(map[string]any)
+	sid, _ := res["sessionId"].(string)
 	if sid == "" {
 		return "", fmt.Errorf("ACP session/new 未返回 sessionId")
 	}
@@ -319,6 +333,8 @@ func (p *agentProc) prompt(ctx context.Context, sessionID, text string) (string,
 	if r["error"] != nil {
 		return "", fmt.Errorf("ACP session/prompt: %v", r["error"])
 	}
-	stop, _ := r["result"].(map[string]any)["stopReason"].(string)
+	// 同上：畸形响应不应 panic。
+	res, _ := r["result"].(map[string]any)
+	stop, _ := res["stopReason"].(string)
 	return stop, nil
 }

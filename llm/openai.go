@@ -121,7 +121,9 @@ func toOpenAIMessages(systemPrompt string, msgs []ChatMessage) []openAIMessage {
 	return out
 }
 
-// openAIStreamChunk 是流式响应里一个 data: 行的 JSON 结构。
+// openAIStreamChunk 是流式响应里一个 data: 行的 JSON 结构。error 字段
+// 捕获 OpenAI 兼容网关流中途的差错块（data: {"error":{...}}）——无它时
+// JSON 反序列化会「成功」得到零 Choices，错误被静默吞掉、伪装成空回复。
 type openAIStreamChunk struct {
 	Choices []struct {
 		Delta struct {
@@ -135,6 +137,10 @@ type openAIStreamChunk struct {
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	} `json:"error"`
 }
 
 // openAIStreamToolCall 是流式 delta.tool_calls 的分片结构。
@@ -224,6 +230,18 @@ func (c *OpenAIClient) StreamChatEvents(ctx context.Context, req ChatRequest, on
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			return finishReason, fmt.Errorf("解析 OpenAI 流式响应失败: %w", err)
 		}
+		// 流中途差错块：以错误返回结束本轮，否则配额/过载错误会伪装成
+		// 空回复走到 DefaultEmptyText 兜底。
+		if chunk.Error != nil {
+			msg := chunk.Error.Message
+			if msg == "" {
+				msg = "服务端流式返回 error 块"
+			}
+			if chunk.Error.Type != "" {
+				msg += " (" + chunk.Error.Type + ")"
+			}
+			return finishReason, fmt.Errorf("OpenAI 流式响应中断: %s", msg)
+		}
 		for _, choice := range chunk.Choices {
 			// 推理模型（GLM/DeepSeek）的思维链增量（reasoning_content）默认
 			// 只在 IncludeReasoning 开启时透传；消息机器人场景通常只发正文。
@@ -238,6 +256,10 @@ func (c *OpenAIClient) StreamChatEvents(ctx context.Context, req ChatRequest, on
 				}
 			}
 			for _, tc := range choice.Delta.ToolCalls {
+				// index 负值（畸形/不兼容网关）会越界 panic；防御性跳过。
+				if tc.Index < 0 {
+					continue
+				}
 				for tc.Index >= len(toolAccs) {
 					toolAccs = append(toolAccs, &toolCallAccum{})
 				}

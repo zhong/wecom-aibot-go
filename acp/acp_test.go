@@ -220,6 +220,12 @@ func fakeAdapterMain() {
 						map[string]any{"optionId": "reject-1", "kind": "reject_once", "name": "拒绝"},
 					}}})
 			}
+			// 挂死模式（超时测试专用）：收到 prompt 后永不回响应——钉
+			// PromptTimeoutMS 必须真实生效（旧实现 select 无 timer，会话
+			// 永久卡死）。
+			if os.Getenv("FAKE_ADAPTER_HANG") == "1" {
+				continue
+			}
 			// 延迟模式（钉占位帧时序用）：prompt 后静默 FAKE_ADAPTER_DELAY_MS
 			// 毫秒才推首 chunk，验证占位帧无需求等首 chunk。
 			if d := os.Getenv("FAKE_ADAPTER_DELAY_MS"); d != "" {
@@ -479,5 +485,44 @@ func TestChatKeyOf(t *testing.T) {
 	}
 	if got := chatKeyOf(wecomaibot.BaseMessage{}, "u1"); got != "dm:u1" {
 		t.Errorf("单聊路由键 = %q", got)
+	}
+}
+
+// TestPromptTimeoutActuallyEnforced 钉住 PromptTimeoutMS 真实生效：
+// 假适配器 HANG 模式收到 prompt 后永不回响应——旧实现的 call select 里
+// 没有任何 timer，超时形同虚设，挂死的适配器会把该会话的串行锁与
+// Handle 的 defer 收尾永久卡死。修复后应在 PromptTimeoutMS 内以
+// 超时错误返回。
+func TestPromptTimeoutActuallyEnforced(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cfg := fakeAdapterConfigEnv("FAKE_ADAPTER_HANG=1")
+	cfg.PromptTimeoutMS = 500 // 半秒超时：远小于 ctx 的 15s，钉的是 timer 生效
+	proc, err := newAgentProc(ctx, cfg)
+	if err != nil {
+		t.Fatalf("newAgentProc: %v", err)
+	}
+	if err := proc.initialize(ctx); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	sid, err := proc.newSessionOnly(ctx, "/tmp")
+	if err != nil {
+		t.Fatalf("session/new: %v", err)
+	}
+
+	start := time.Now()
+	_, err = proc.prompt(ctx, sid, "会挂死的一条消息")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("挂死的适配器必须超时返回错误, 不能永久阻塞")
+	}
+	if !strings.Contains(err.Error(), "超时") {
+		t.Errorf("应为超时错误: %v", err)
+	}
+	// ctx 有 15s 余量：2.5s 内返回证明是 timeoutMS 的 timer 在起作用，
+	// 而不是等到 ctx 超时兜底。
+	if elapsed > 2500*time.Millisecond {
+		t.Errorf("超时应由 PromptTimeoutMS 生效而非 ctx 兜底: %v", elapsed)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -381,24 +382,88 @@ func TestRouterBindQuotedAttachmentHint(t *testing.T) {
 	}
 }
 
-// TestRouterBindDirectAttachmentHint 三个直发附件回调（图片/视频/文件）
-// 的 prompt 都应携带 read_attachment 引导——实测踩坑：无引导时 agent 在
-// 文件系统里盲找落盘文件（ENOENT）而不调工具。
+// TestRouterBindDirectAttachmentHint 三个直发附件回调的 prompt 组装由
+// Router.saveInflight 决定（PR #12 起：附件优先落盘到会话 cwd，模型无
+// MCP 工具也可直接读取；落盘失败/未启用工具面时退回 read_attachment
+// 引导——pi-acp RPC 模式不加载 MCP 客户端时该提示无效但不致误导）。
+// 本测试直接钉 saveInflight 的两条断言：成功落盘 → 路径后缀；不可落盘
+// → hint 兜底。
 func TestRouterBindDirectAttachmentHint(t *testing.T) {
-	base := "[用户发来文件]"
-	if !strings.HasSuffix(base+attachmentHint, attachmentHint) {
-		t.Fatal("impossible")
+	// 附件下载服务（文件正文）
+	dlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("张三,李四"))
+	}))
+	t.Cleanup(dlSrv.Close)
+
+	// 未启用工具面：cwd 为空 → hint 兜底
+	srv := newACPWSServer(t)
+	bot, err := wecomaibot.NewClient(wecomaibot.Config{
+		BotID: "bot", Secret: "secret", WSURL: srv.url(),
+		HeartbeatIntervalMS: 60000, Logger: silentLogger{},
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
 	}
-	for _, tt := range []struct {
-		name   string
-		prompt string
-	}{
-		{"文件", "[用户发来文件]" + attachmentHint},
-		{"图片", "[用户发来一张图片]" + attachmentHint},
-		{"视频", "[用户发来一段视频]" + attachmentHint},
-	} {
-		if !strings.Contains(tt.prompt, "read_attachment") {
-			t.Errorf("%s: prompt 应含 read_attachment 引导: %q", tt.name, tt.prompt)
-		}
+	if err := bot.Connect(); err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	waitConnected(t, bot)
+	t.Cleanup(bot.Disconnect)
+	router, err := NewRouter(context.Background(), bot, fakeAdapterConfig())
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	fmsg := wecomaibot.FileMessage{}
+	fmsg.ReqID = "req_hint_1"
+	fmsg.ChatID = "chat_1"
+	fmsg.File.URL = dlSrv.URL
+	if got := router.saveInflight(fmsg); got != attachmentHint {
+		t.Errorf("未启用工具面应回退 hint: %q", got)
+	}
+
+	// 启用工具面：附件落盘到会话 cwd → 路径后缀
+	mcpSrv, err := mcp.NewWeComServer(bot, "test_token")
+	if err != nil {
+		t.Fatalf("NewWeComServer: %v", err)
+	}
+	if err := mcpSrv.Start(mcp.DefaultAddr); err != nil {
+		t.Fatalf("mcp Start: %v", err)
+	}
+	t.Cleanup(func() { _ = mcpSrv.Close() })
+	workDir := t.TempDir()
+	if err := router.EnableTools(mcpSrv, workDir); err != nil {
+		t.Fatalf("EnableTools: %v", err)
+	}
+	fmsg2 := wecomaibot.FileMessage{}
+	fmsg2.ReqID = "req_hint_2"
+	fmsg2.ChatID = "chat_1"
+	fmsg2.File.URL = dlSrv.URL
+	got := router.saveInflight(fmsg2)
+	if !strings.Contains(got, "附件已保存到") || !strings.Contains(got, workDir) {
+		t.Fatalf("落盘成功后缀应含落盘路径: %q", got)
+	}
+	// 落盘的文件本体应真的可读且内容一致
+	rest, ok := strings.CutPrefix(got, "\n[附件已保存到 ")
+	if !ok {
+		t.Fatalf("后缀格式不对: %q", got)
+	}
+	savePath, _, ok := strings.Cut(rest, "，可直接读取该文件]")
+	if !ok {
+		t.Fatalf("后缀格式不对: %q", got)
+	}
+	if b, err := os.ReadFile(savePath); err != nil || string(b) != "张三,李四" {
+		t.Errorf("落盘文件应可读且内容一致: err=%v content=%q", err, string(b))
+	}
+
+	// 混排消息同路径：附件同样被提取落盘（不静默丢失）
+	mmsg := wecomaibot.MixedMessage{}
+	mmsg.ReqID = "req_hint_3"
+	mmsg.ChatID = "chat_1"
+	mmsg.Mixed.MsgItem = append(mmsg.Mixed.MsgItem,
+		wecomaibot.MixedMsgItem{Text: &wecomaibot.TextContent{Content: "看这张图"}},
+		wecomaibot.MixedMsgItem{Image: &wecomaibot.ImageContent{URL: dlSrv.URL}},
+	)
+	if got := router.saveInflight(mmsg); !strings.Contains(got, "附件已保存到") {
+		t.Errorf("混排附件应同路径落盘: %q", got)
 	}
 }

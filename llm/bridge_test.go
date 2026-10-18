@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -90,6 +91,14 @@ func (s *botWSServer) record(frame wecomaibot.WsFrameRaw) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.frames = append(s.frames, frame)
+}
+
+// setAckDelayMS 配置回复帧 ACK 的注入延迟：ACK 积压时 ReplyStreamNonBlocking
+// 的 HasPendingAck 判定生效（流式帧在上一帧未 ACK 时跳发），供跳帧路径测试。
+func (s *botWSServer) setAckDelayMS(ms int) {
+	s.mu.Lock()
+	s.ackDelayMS = ms
+	s.mu.Unlock()
 }
 
 // streamFrames 依序返回 body.stream 内容非空的帧（流式回复帧）。
@@ -272,7 +281,9 @@ func TestStreamReplyHappyPath(t *testing.T) {
 		}
 		done <- final
 	})
-	<-done
+	// 取回返回值供下方断言：先消费在测试体，恒走 default 的旧写法
+	// 等于把这条断言判了死刑。
+	final := <-done
 	// 等服务端把 ACK 落账
 	time.Sleep(200 * time.Millisecond)
 
@@ -297,12 +308,8 @@ func TestStreamReplyHappyPath(t *testing.T) {
 		t.Errorf("同一流的 streamID 应一致: %q vs %q", last.ID, frames[0].ID)
 	}
 	// 返回的 finalText 供多轮历史补记，应等于终帧全文
-	select {
-	case final := <-done:
-		if final != "你好，世界" {
-			t.Errorf("finalText = %q, 期望全文", final)
-		}
-	default:
+	if final != "你好，世界" {
+		t.Errorf("finalText = %q, 期望全文", final)
 	}
 }
 
@@ -565,5 +572,68 @@ func TestAgentReplyErrorClosesStream(t *testing.T) {
 	last := frames[len(frames)-1]
 	if !last.Finish || last.Content != "前半" {
 		t.Errorf("终帧应带半截内容: %+v", last)
+	}
+}
+
+// TestReplyStreamNonBlockingSkipsPendingAck 钉跳帧分支（reply.go
+// NonBlocking：非 finish 帧若有上一帧未 ACK 则跳发，finish 帧必发）。
+// 该分支被 llm/acp 两个 bridge 的生产路径每日使用，但此前零覆盖：
+// 假服务端给回复帧 ACK 注入延迟制造积压，直接观察 skipped 语义。
+func TestReplyStreamNonBlockingSkipsPendingAck(t *testing.T) {
+	srv := newBotWSServer(t)
+	srv.setAckDelayMS(500) // 第一帧的 ACK 迟到，制造 pending 窗口
+
+	botCh := make(chan *wecomaibot.Client, 1)
+	connectBot(t, srv, func(bot *wecomaibot.Client, msg wecomaibot.TextMessage) {
+		botCh <- bot
+	})
+	var bot *wecomaibot.Client
+	select {
+	case bot = <-botCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("bot 未就绪")
+	}
+	msg := wecomaibot.TextMessage{}
+	msg.ReqID = "req_nb_1"
+	msg.ChatID = "chat_1"
+
+	// Reply 是「发送并阻塞等 ACK」语义：同步发送返回时 ACK 已落账、
+	// pending 已清。要在 pending 窗口内观察跳帧，须让首帧在途——
+	// goroutine 发首帧，ACK 延迟窗口内主线程打 NonBlocking 帧。
+	firstDone := make(chan error, 1)
+	go func() {
+		_, skipped, err := bot.ReplyStreamNonBlocking(msg, "sid_nb", "第一帧", false, nil, nil)
+		if skipped {
+			firstDone <- errors.New("无 pending 时首帧不应跳发")
+			return
+		}
+		firstDone <- err
+	}()
+	// 等首帧进入 pendingAcks（发送立即登记，不等 ACK）
+	pendingDeadline := time.Now().Add(2 * time.Second)
+	for !bot.HasPendingAck("req_nb_1") && time.Now().Before(pendingDeadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !bot.HasPendingAck("req_nb_1") {
+		t.Fatal("前置失败: 首帧应已在途等待 ACK")
+	}
+	// 在途窗口内：非结束帧应跳发
+	_, skipped, err := bot.ReplyStreamNonBlocking(msg, "sid_nb", "第二帧", false, nil, nil)
+	if err != nil {
+		t.Fatalf("跳帧调用不应报错: %v", err)
+	}
+	if !skipped {
+		t.Fatal("有 pending ACK 时非结束帧应跳发 (skipped=true)")
+	}
+	// 结束帧：pending 之下也必须发送
+	_, skipped, err = bot.ReplyStreamNonBlocking(msg, "sid_nb", "全文", true, nil, nil)
+	if err != nil {
+		t.Fatalf("结束帧发送失败: %v", err)
+	}
+	if skipped {
+		t.Fatal("结束帧 (finish=true) 不得跳发")
+	}
+	if err := <-firstDone; err != nil {
+		t.Fatalf("首帧收尾: %v", err)
 	}
 }

@@ -87,21 +87,10 @@ func TestDecryptFileRejectsInvalidInput(t *testing.T) {
 	}
 }
 
-// PKCS#7 填充值上界按官方文档为 32（不是 AES 块大小 16）：1~32 都合法，0 与 >32 非法。
-func TestTrimPKCS7PaddingRejectsOverSizedPadding(t *testing.T) {
-	if _, err := trimPKCS7Padding(bytes.Repeat([]byte{32}, 32)); err != nil {
-		t.Errorf("填充值 32 在官方上界内，应被接受: %v", err)
-	}
-	if _, err := trimPKCS7Padding(bytes.Repeat([]byte{33}, 33)); err == nil {
-		t.Error("填充值 33 超过上界 32，应返回错误")
-	}
-	if _, err := trimPKCS7Padding([]byte{16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16}); err != nil {
-		t.Error("合法填充值 16 应被接受")
-	}
-}
-
 // PKCS#7 填充边界：官方文档按 32 字节对齐，pad 值 1..32 均合法（剥掉全部填充后为空），
-// 0 与 >32 非法。
+// 0 与 >32 非法。参数化已覆盖 TestTrimPKCS7PaddingRejectsOverSizedPadding 的全部三个
+// 判定分支（p=1..32 含 16 与 32 的接受分支，0/33 是拒绝分支），两者测同一函数
+// 同一分支集，保留参数化版本即可。
 func TestTrimPKCS7PaddingBoundaries(t *testing.T) {
 	for p := 1; p <= 32; p++ {
 		data := bytes.Repeat([]byte{byte(p)}, p)
