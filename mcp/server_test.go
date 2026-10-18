@@ -676,3 +676,73 @@ func TestSendRateLimitNotAffectReadAttachment(t *testing.T) {
 		}
 	}
 }
+
+// TestChatKeyEscapeHTTPRoundTrip 含 % 的 chatKey 经 HTTP 路由不得与
+// 转义后的其他键坍缩到同一端点：r.URL.Path 已被 net/http 解码一次，
+// 服务端再解码就成双重解码——"a%2Fb" 与 "a/b" 两个不同的键会被折
+// 到同一个会话（纯函数往返测试穿不过 HTTP 路由层，须整层钉）。
+func TestChatKeyEscapeHTTPRoundTrip(t *testing.T) {
+	e := newTestEnv(t, "")
+	e.mcp.SetChat("a%2Fb", e.msg, "")
+	defer e.mcp.ClearChat("a%2Fb")
+	// c1 用 tools/call 断言注册表命中（ping 不查注册表，判别不了路由）。
+	c1 := e.clientFor("a%2Fb")
+	out1 := c1.call(t, 1, "tools/call", map[string]any{
+		"name": "read_attachment", "arguments": map[string]any{},
+	})
+	res1, _ := out1["result"].(map[string]any)
+	text1 := ""
+	if content, ok := res1["content"].([]any); ok && len(content) > 0 {
+		if m, ok := content[0].(map[string]any); ok {
+			text1, _ = m["text"].(string)
+		}
+	}
+	if strings.Contains(text1, "没有进行中的消息") {
+		t.Fatalf(`"a%%2Fb" 已登记快照, 应命中注册表(双重解码会把它误译成别的键): %s`, text1)
+	}
+	// "a/b" 是不同的键：PathEscape 后是 "a%2Fb" 的转义形态——两者在
+	// 服务端必须解析回各自的原键，不得坍缩。
+	c2 := &mcpClient{base: e.mcp.URLFor("a/b"), token: e.mcp.Token(), http: &http.Client{}}
+	out2 := c2.call(t, 1, "tools/call", map[string]any{
+		"name": "send_markdown", "arguments": map[string]any{"content": "x"},
+	})
+	res, _ := out2["result"].(map[string]any)
+	text := ""
+	if content, ok := res["content"].([]any); ok && len(content) > 0 {
+		if m, ok := content[0].(map[string]any); ok {
+			text, _ = m["text"].(string)
+		}
+	}
+	if !strings.Contains(text, "没有进行中的消息") {
+		t.Errorf(`"a/b" 键未登记快照, 应答 ok:false 自纠; 实际: %s`, text)
+	}
+}
+
+// TestSendRateLimitSnapshotMissNotConsumed 快照未命中的外发调用不应
+// 消耗频控额度：agent 在 prompt 窗口外补发的调用（如 ask 刚返回、
+// ClearChat 已执行）返回 ok:false 自纠，但这次空转不能挡住紧接着的
+// 合法发送（旧实现在 miss 分支早退，不做 release）。
+func TestSendRateLimitSnapshotMissNotConsumed(t *testing.T) {
+	e := newTestEnv(t, "")
+	e.mcp.SetSendMinInterval(10 * time.Second)
+
+	// 不登记快照直接调端点：ok:false 自纠。
+	c := e.clientFor("chat_7")
+	out := c.call(t, 1, "tools/call", map[string]any{
+		"name": "send_markdown", "arguments": map[string]any{"content": "x"},
+	})
+	res, _ := out["result"].(map[string]any)
+	text := ""
+	if content, ok := res["content"].([]any); ok && len(content) > 0 {
+		if m, ok := content[0].(map[string]any); ok {
+			text, _ = m["text"].(string)
+		}
+	}
+	if !strings.Contains(text, "没有进行中的消息") {
+		t.Fatalf("快照未命中应 ok:false 自纠: %s", text)
+	}
+	// 紧接着的合法发送（登记快照后）不被空转调用挡住。
+	if got := e.runInChat(t, "chat_7", e.msg, "send_markdown", `{"content":"ok"}`); !strings.Contains(got, `"ok":true`) {
+		t.Fatalf("miss 调用不应消耗频控额度: %s", got)
+	}
+}

@@ -169,7 +169,14 @@ func (s *WeComServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	rest, ok := strings.CutPrefix(r.URL.Path, "/mcp/")
+	// 用 EscapedPath 取原始（未解码)路径段再解一次：r.URL.Path 已被
+	// net/http 解码过，二次解码会让含 % 的键与转义别的键坍缩。
+	// 用 EscapedPath 取原始（未解码)路径段再解一次：r.URL.Path 已被
+	// net/http 解码过，二次解码会让含 % 的键与转义别的键坍缩。
+	// 用 EscapedPath 取原始（未解码)路径段再解一次：r.URL.Path 已被
+	// net/http 解码过，二次解码会让含 % 的键与转义别的键坍缩。
+	seg := r.URL.EscapedPath()
+	rest, ok := strings.CutPrefix(seg, "/mcp/")
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -277,30 +284,45 @@ func (s *WeComServer) handleToolsCall(ctx context.Context, chatKey string, param
 	}
 	// 外发类工具频控：被限即在工具结果里如实告知（模型可自纠等待/放弃），
 	// 不当协议错。限速器 nil 或 interval 0 时零开销放行。
+	limToken := 0
 	if sendTools[name] {
-		if ok, wait := s.sendLimiter.allow(chatKey); !ok {
+		ok, wait, token := s.sendLimiter.allow(chatKey)
+		if !ok {
 			return toolTextResult(`{"ok":false,"errcode":0,"errmsg":"发送过于频繁，` +
 				`请等待 ` + wait.Truncate(time.Millisecond).String() + ` 后再试"}`), nil
 		}
+		limToken = token
 	}
 	args := json.RawMessage("{}")
 	if p, ok := params["arguments"]; ok && len(p) > 0 {
 		args = p
 	}
 
+	// 快照未命中同样回滚频控占用：这次调用没有发出任何企微消息，不应
+	// 挡住紧接着的合法发送（与下面的「结果未 ok 即回滚」同一语义）。
+	// 快照未命中同样回滚频控占用：这次调用没有发出任何企微消息，不应
+	// 挡住紧接着的合法发送（与下面的「结果未 ok 即回滚」同一语义）。
 	entry, ok := s.reg.get(chatKey)
 	if !ok {
+		if sendTools[name] {
+			s.sendLimiter.release(chatKey, limToken)
+		}
 		return toolTextResult(`{"ok":false,"errcode":0,"errmsg":"该会话当前没有进行中的消息，无法执行企微工具"}`), nil
 	}
 	exec := llm.NewWeComExecutorCwd(s.bot, entry.req, entry.saveDir)
 	out, err := exec(ctx, name, args)
 	if err != nil {
+		// 工具执行出错：同样没有发出消息，回滚占用再走协议错。
+		if sendTools[name] {
+			s.sendLimiter.release(chatKey, limToken)
+		}
 		return nil, &rpcError{code: -32603, message: err.Error()}
 	}
 	// 外发类工具真正发出企微消息才消耗频控额度：结果未 ok（参数错/发送
-	// 失败/无法定位会话）时回滚本次占用，失败重试不会被自己挡住。
+	// 失败）时回滚本次占用（token 属主化——只删自己登记的那次，并发期间
+	// 别人的成功登记不受影响），失败重试不会被自己挡住。
 	if sendTools[name] && !resultOK(out) {
-		s.sendLimiter.release(chatKey)
+		s.sendLimiter.release(chatKey, limToken)
 	}
 	return toolTextResult(out), nil
 }
