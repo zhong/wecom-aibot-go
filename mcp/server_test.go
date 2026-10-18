@@ -746,3 +746,34 @@ func TestSendRateLimitSnapshotMissNotConsumed(t *testing.T) {
 		t.Fatalf("miss 调用不应消耗频控额度: %s", got)
 	}
 }
+
+func TestParseErrorBadJSON(t *testing.T) {
+	// 请求体不可解析 → id 为 null 的 -32700 错误（MCP 契约：解析失败时
+	// id 不可知，必须回 null 而不是回传）。writeJSONRPCError 的唯一触发面。
+	e := newTestEnv(t, "tok_1")
+	req, _ := http.NewRequest(http.MethodPost, e.mcp.URLFor("chat_1"),
+		strings.NewReader("{这不是 JSON"))
+	req.Header.Set("Authorization", "Bearer "+e.mcp.Token())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST 失败: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("坏请求体应 200 带协议错, 实际 %d", resp.StatusCode)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("应答应为 JSON: %v", err)
+	}
+	if out["id"] != nil {
+		t.Errorf("解析失败 id 必须为 null: %v", out["id"])
+	}
+	errObj, _ := out["error"].(map[string]any)
+	if errObj == nil || errObj["code"].(float64) != -32700 {
+		t.Errorf("坏 JSON 应 -32700: %v", out)
+	}
+	if out["jsonrpc"] != "2.0" {
+		t.Errorf("jsonrpc 字段缺失: %v", out)
+	}
+}
