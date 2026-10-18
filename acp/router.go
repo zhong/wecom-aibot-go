@@ -78,7 +78,7 @@ func (r *Router) entry(chatKey string) (*sessionEntry, error) {
 	if surface != nil {
 		cwd = sessionWorkDir(workDir, chatKey)
 	}
-	acpID, err := r.proc.initializeSession(context.Background(), cwd)
+	acpID, err := r.proc.newSessionOnly(context.Background(), cwd)
 	if err != nil {
 		return nil, err
 	}
@@ -131,22 +131,7 @@ func RouterBind(bot *wecomaibot.Client, r *Router) {
 			}
 		}
 	}
-	// saveInflight 把在途附件落盘到该会话 agent 的 cwd，返回 prompt 后缀：
-	// pi-acp 0.0.34 的 RPC 模式不加载 MCP 客户端（模型知道工具名但手
-	// 上没有可调用的工具），不落盘的话模型只能满文件系统盲找。落盘失败
-	// 时退回 read_attachment 引导（本机 MCP 客户端形态仍可用）。
-	saveInflight := func(req wecomaibot.RequestCarrier) string {
-		chatKey := chatKeyOfReq(req)
-		cwd := r.sessionCwd(chatKey)
-		if cwd == "" {
-			return attachmentHint
-		}
-		path, err := llm.SaveInflightAttachment(context.Background(), r.bot, req, cwd)
-		if err != nil || path == "" {
-			return attachmentHint
-		}
-		return "\n[附件已保存到 " + path + "，可直接读取该文件]"
-	}
+	// saveInflight 已从闭包提为 Router 方法（见下）：测试直打该路径。
 	bot.OnText(func(ctx context.Context, m wecomaibot.TextMessage) {
 		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, textWithQuoteHint(m.Text.Content, m.Quote))
 	})
@@ -155,15 +140,18 @@ func RouterBind(bot *wecomaibot.Client, r *Router) {
 		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, m.Voice.Content)
 	})
 	bot.OnImage(func(ctx context.Context, m wecomaibot.ImageMessage) {
-		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, "[用户发来一张图片]"+saveInflight(m))
+		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, "[用户发来一张图片]"+r.saveInflight(m))
 	})
 	bot.OnVideo(func(ctx context.Context, m wecomaibot.VideoMessage) {
-		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, "[用户发来一段视频]"+saveInflight(m))
+		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, "[用户发来一段视频]"+r.saveInflight(m))
 	})
 	bot.OnFile(func(ctx context.Context, m wecomaibot.FileMessage) {
-		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, "[用户发来文件]"+saveInflight(m))
+		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, "[用户发来文件]"+r.saveInflight(m))
 	})
 	bot.OnMixed(func(ctx context.Context, m wecomaibot.MixedMessage) {
+		// 图文混排：正文文本进 prompt，附件走与直发消息同路径的落盘
+		// （llm.attachmentOf 支持从 MixedMsgItem 提取附件——不落盘的话
+		// 混排里的图既读不到也无提示，静默丢失）。
 		var sb []byte
 		for _, item := range m.Mixed.MsgItem {
 			if item.Text != nil && item.Text.Content != "" {
@@ -171,8 +159,26 @@ func RouterBind(bot *wecomaibot.Client, r *Router) {
 				sb = append(sb, '\n')
 			}
 		}
-		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, string(sb))
+		handle(ctx, chatKeyOf(m.BaseMessage, m.From.UserID), m, string(sb)+r.saveInflight(m))
 	})
+}
+
+// saveInflight 把在途附件落盘到该会话 agent 的 cwd，返回 prompt 后缀：
+// pi-acp 0.0.34 的 RPC 模式不加载 MCP 客户端（模型知道工具名但手
+// 上没有可调用的工具），不落盘的话模型只能满文件系统盲找。落盘失败
+// 或工具面未启用（cwd 为空）时退回 read_attachment 引导（本机 MCP
+// 客户端形态仍可用）。
+func (r *Router) saveInflight(req wecomaibot.RequestCarrier) string {
+	chatKey := chatKeyOfReq(req)
+	cwd := r.sessionCwd(chatKey)
+	if cwd == "" {
+		return attachmentHint
+	}
+	path, err := llm.SaveInflightAttachment(context.Background(), r.bot, req, cwd)
+	if err != nil || path == "" {
+		return attachmentHint
+	}
+	return "\n[附件已保存到 " + path + "，可直接读取该文件]"
 }
 
 // attachmentHint 是直发附件消息的 prompt 后缀：直发的图片/文件/视频
@@ -218,14 +224,6 @@ func chatKeyOfReq(req wecomaibot.RequestCarrier) string {
 		return chatKeyOf(m.BaseMessage, m.From.UserID)
 	case wecomaibot.MixedMessage:
 		return chatKeyOf(m.BaseMessage, m.From.UserID)
-	case wecomaibot.EventMessage:
-		return chatKeyOf(wecomaibot.BaseMessage{ChatID: m.ChatID, ReqID: m.ReqID}, "")
 	}
 	return ""
-}
-
-// initializeSession 在已有 initialize 握手之后新建一个 agent 会话，
-// cwd 作为 agent 会话的工作目录。
-func (p *agentProc) initializeSession(ctx context.Context, cwd string) (string, error) {
-	return p.newSessionOnly(ctx, cwd)
 }
