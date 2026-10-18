@@ -61,7 +61,7 @@ func TestAnthropicClientStreamChat(t *testing.T) {
 			t.Errorf("anthropic-version 头不对: %q", got)
 		}
 		var body anthropicChatRequest
-		if err := jsonNewDecoder(r).Decode(&body); err != nil {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("解析请求体失败: %v", err)
 		}
 		if !body.Stream {
@@ -116,7 +116,7 @@ func TestAnthropicClientMaxTokensFallback(t *testing.T) {
 	var got int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body anthropicChatRequest
-		if err := jsonNewDecoder(r).Decode(&body); err == nil {
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
 			got = body.MaxTokens
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -385,4 +385,43 @@ func (m *decodedAnthropicMsg) UnmarshalJSON(b []byte) error {
 		return json.Unmarshal(probe.Content, &m.ContentPlain)
 	}
 	return json.Unmarshal(probe.Content, &m.Content)
+}
+
+// TestAnthropicStreamErrorEvent 流中途的服务端 error 事件（配额/过载）
+// 应以错误返回，不能静默落到「未发 message_stop 视为正常结束」的兜底——
+// 否则半截回复被当正常完成、错误伪装成空回复。
+func TestAnthropicStreamErrorEvent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n" +
+			`data: {"type":"message_start","message":{"id":"msg_1"}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"半截"}}` + "\n\n" +
+			"event: error\n" +
+			`data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}` + "\n\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewAnthropicClient(AnthropicOptions{
+		APIKey: "test-key", BaseURL: srv.URL, Model: "claude-sonnet-5-5",
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	var deltas []string
+	_, err = client.StreamChat(context.Background(), ChatRequest{
+		Messages: []ChatMessage{{Role: "user", Content: "hi"}},
+	}, func(delta string) error {
+		deltas = append(deltas, delta)
+		return nil
+	})
+	if err == nil {
+		t.Fatal("error 事件应导致 StreamChat 返回错误, 不能视为正常完成")
+	}
+	if !strings.Contains(err.Error(), "Overloaded") {
+		t.Errorf("错误应携带服务端信息: %v", err)
+	}
+	if len(deltas) != 1 || deltas[0] != "半截" {
+		t.Errorf("事件前的增量应已送达: %v", deltas)
+	}
 }

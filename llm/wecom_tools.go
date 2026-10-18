@@ -412,7 +412,6 @@ func attachmentMetaJSON(filename, msgType string, size int, savePath string) str
 	return string(b)
 }
 
-// attachmentMetaJSON 拼二进制附件的元信息返回：模型据此说明收到了什么。
 // toolResultJSON 拼回喂给模型的工具结果（ok/errmsg 的 JSON 字符串）。
 func toolResultJSON(ok bool, errcode int, errmsg string) string {
 	b, _ := json.Marshal(map[string]any{

@@ -360,3 +360,39 @@ func TestOpenAIRequestToolWire(t *testing.T) {
 		t.Errorf("Tools 空时不应发 tools/tool_choice: %s", rawReq)
 	}
 }
+
+// TestOpenAIStreamErrorChunk 流中途的 OpenAI 兼容网关 error 块
+// （data: {"error":{...}}）应以错误返回——它不带 choices，旧实现反序列化
+// 「成功」得到零 Choices，错误被静默吞掉、伪装成空回复。
+func TestOpenAIStreamErrorChunk(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + `{"choices":[{"delta":{"content":"半截"}}]}` + "\n\n" +
+			"data: " + `{"error":{"message":"Rate limit exceeded","type":"rate_limit_error"}}` + "\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewOpenAIClient(OpenAIOptions{
+		APIKey: "test-key", BaseURL: srv.URL, Model: "gpt-x",
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	var deltas []string
+	_, err = client.StreamChat(context.Background(), ChatRequest{
+		Messages: []ChatMessage{{Role: "user", Content: "hi"}},
+	}, func(delta string) error {
+		deltas = append(deltas, delta)
+		return nil
+	})
+	if err == nil {
+		t.Fatal("error 块应导致 StreamChat 返回错误, 不能伪装成空回复")
+	}
+	if !strings.Contains(err.Error(), "Rate limit exceeded") {
+		t.Errorf("错误应携带服务端信息: %v", err)
+	}
+	if len(deltas) != 1 || deltas[0] != "半截" {
+		t.Errorf("error 块前的增量应已送达: %v", deltas)
+	}
+}
